@@ -90,7 +90,7 @@ class DINEncoder(SequenceEncoder):
         super().__init__(input)
         self._query_dim = query_dim
         self._sequence_dim = sequence_dim
-        if self._query_dim > self._sequence_dim:
+        if self._query_dim != self._sequence_dim:
             raise ValueError("query_dim > sequence_dim not supported yet.")
         self.mlp = MLP(in_features=sequence_dim * 4, dim=3, **attn_mlp)
         self.linear = nn.Linear(self.mlp.hidden_units[-1], 1)
@@ -116,8 +116,8 @@ class DINEncoder(SequenceEncoder):
             max_seq_length, device=sequence_length.device
         ).unsqueeze(0) < sequence_length.unsqueeze(1)
 
-        if self._query_dim < self._sequence_dim:
-            query = F.pad(query, (0, self._sequence_dim - self._query_dim))
+        # if self._query_dim < self._sequence_dim:
+        #     query = F.pad(query, (0, self._sequence_dim - self._query_dim))
         queries = query.unsqueeze(1).expand(-1, max_seq_length, -1)
 
         attn_input = torch.cat(
@@ -252,9 +252,9 @@ class SelfAttentionEncoder(SequenceEncoder):
         self._multihead_attn_dim = multihead_attn_dim
 
         self._head_dim = self._multihead_attn_dim // num_heads
-        assert self._head_dim * num_heads == self._multihead_attn_dim, (
-            "multihead_attn_dim must be divisible by num_heads"
-        )
+        assert (
+            self._head_dim * num_heads == self._multihead_attn_dim
+        ), "multihead_attn_dim must be divisible by num_heads"
 
         self._query = nn.Linear(sequence_dim, self._multihead_attn_dim)
         self._key = nn.Linear(sequence_dim, self._multihead_attn_dim)
@@ -357,7 +357,9 @@ class MultiWindowDINEncoder(SequenceEncoder):
         pad_att_sequences = F.pad(att_sequences, pad).transpose(0, 1)
         result = torch.segment_reduce(
             pad_att_sequences, reduce="sum", lengths=self.windows_len, axis=0
-        ).transpose(0, 1)  # [B, L, C]
+        ).transpose(
+            0, 1
+        )  # [B, L, C]
 
         segment_length = torch.min(
             sequence_length.unsqueeze(1) - self.cumsum_windows_len.unsqueeze(0),

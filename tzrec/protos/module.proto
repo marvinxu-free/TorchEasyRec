@@ -96,6 +96,14 @@ message CIN {
     repeated uint32 cin_layer_size = 1;
 }
 
+message RawDenseReducer {
+    // features to reduce dimension
+    repeated string feature_names = 1;
+    // reduction network structure (e.g. 512 -> 256 -> 64)
+    // each feature gets its own independent MLP instance with this config
+    required MLP reducer = 2;
+}
+
 message WuKongLayer {
     // LinearCompressBlock output feature num
     required uint32 lcb_feature_num = 1;

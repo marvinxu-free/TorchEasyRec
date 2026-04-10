@@ -32,6 +32,8 @@ MANIFEST
 .vscode/
 .qoder/
 .claude/
+.history/
+memory/
 
 # Proto
 protoc*

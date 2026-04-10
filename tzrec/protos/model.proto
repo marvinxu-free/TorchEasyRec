@@ -52,6 +52,11 @@ message ModelConfig {
         DCNV2 dcn_v2 = 107;
         xDeepFM xdeepfm = 108;
         WuKong wukong = 109;
+        WuKongDIN wukong_din = 123;
+        DCNV3 dcn_v3 = 120;
+        xDeepFM2 xdeepfm2 = 121;
+        DCNV4 dcn_v4 = 122;
+        ThreeTowerDCN three_tower_dcn = 124;
 
         SimpleMultiTask simple_multi_task = 200;
         MMoE mmoe = 201;
