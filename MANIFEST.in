@@ -1,1 +1,3 @@
 recursive-include tzrec/protos *.proto
+recursive-include tzrec/protos *_pb2.py
+recursive-include tzrec/protos *_pb2.pyi

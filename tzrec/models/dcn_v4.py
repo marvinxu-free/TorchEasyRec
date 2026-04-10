@@ -23,8 +23,12 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.utils.config_util import config_to_kwargs
 
 
-class DCNV2(RankModel):
-    """Deep cross network v2.
+class DCNV4(RankModel):
+    """Deep cross network v4 with serial (vertical) architecture.
+
+    Unlike DCNv2 where Cross and Deep are parallel branches concatenated
+    together, DCNv4 stacks them vertically:
+        embedding -> backbone -> CrossV2 -> Deep MLP -> Final MLP -> sigmoid
 
     Args:
         model_config (ModelConfig): an instance of ModelConfig.
@@ -46,24 +50,31 @@ class DCNV2(RankModel):
         self.group_name = self.embedding_group.group_names()[0]
         feature_dim = self.embedding_group.group_total_dim(self.group_name)
 
-        # Cross 分支
+        # Optional backbone
+        if self._model_config.HasField("backbone"):
+            self._backbone = MLP(
+                in_features=feature_dim,
+                **config_to_kwargs(self._model_config.backbone),
+            )
+            cross_input_dim = self._backbone.output_dim()
+        else:
+            self._backbone = None
+            cross_input_dim = feature_dim
+
+        # Cross network
         self.cross = CrossV2(
-            input_dim=feature_dim, **config_to_kwargs(self._model_config.cross)
+            input_dim=cross_input_dim, **config_to_kwargs(self._model_config.cross)
         )
-        self.cross_ln = nn.LayerNorm(self.cross.output_dim())
-        cross_output_dim = self.cross.output_dim()
 
-        # Deep 分支（并行）
+        # Deep MLP (serial: takes cross output as input)
         self.deep = MLP(
-            in_features=feature_dim, **config_to_kwargs(self._model_config.deep)
+            in_features=self.cross.output_dim(),
+            **config_to_kwargs(self._model_config.deep),
         )
-        self.deep_ln = nn.LayerNorm(self.deep.output_dim())
-        deep_output_dim = self.deep.output_dim()
 
-        # Final
-        final_input_dim = cross_output_dim + deep_output_dim
+        # Final MLP
         self.final = MLP(
-            in_features=final_input_dim,
+            in_features=self.deep.output_dim(),
             **config_to_kwargs(self._model_config.final),
         )
         self.output_mlp = nn.Linear(
@@ -75,16 +86,13 @@ class DCNV2(RankModel):
         feature_dict = self.build_input(batch)
         features = feature_dict[self.group_name]
 
-        # Cross 分支
+        # Optional backbone
+        if self._backbone is not None:
+            features = self._backbone(features)
+
+        # Serial: Cross -> Deep -> Final
         cross_out = self.cross(features)
-        cross_out = self.cross_ln(cross_out)
+        deep_out = self.deep(cross_out)
+        logits = self.output_mlp(self.final(deep_out))
 
-        # Deep 分支（并行）
-        deep_out = self.deep(features)
-        deep_out = self.deep_ln(deep_out)
-
-        # Concat
-        net = torch.concat([cross_out, deep_out], dim=-1)
-
-        out = self.output_mlp(self.final(net))
-        return self._output_to_prediction(out)
+        return self._output_to_prediction(logits)

@@ -72,8 +72,66 @@ message xDeepFM {
 }
 
 
+message xDeepFM2 {
+    required CIN cin = 1;
+    required MLP deep = 2;
+    required MLP final = 3;
+    optional uint32 wide_embedding_dim = 4 [default = 16];
+    // wide embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
+    optional string wide_init_fn = 5;
+    optional RawDenseReducer raw_dense_reducer = 6;
+}
+
+
 message WuKong {
     optional MLP dense_mlp = 1;
     repeated WuKongLayer wukong_layers = 2;
     required MLP final = 3;
+}
+
+
+message WuKongDIN {
+    optional MLP dense_mlp = 1;
+    repeated WuKongLayer wukong_layers = 2;
+    required MLP final = 3;
+}
+
+
+message DCNV3 {
+    optional MLP backbone = 1;
+    required CrossV2 cross = 2;
+    optional MLP deep = 3;
+    required MLP final = 4;
+    optional MLP din = 5;
+    optional MLP din_encoder = 6;
+    optional uint32 max_seq_length = 7 [default = 0];
+    optional MLP bias = 8;
+}
+
+
+message DCNV4 {
+    optional MLP backbone = 1;
+    required CrossV2 cross = 2;
+    optional MLP deep = 3;
+    required MLP final = 4;
+}
+
+
+message EmbeddingSplitConfig {
+    required string group_a = 1;
+    required string group_b = 2;
+    repeated string shared_features = 3;
+    repeated string shared_sequence_groups = 4;
+}
+
+message ThreeTowerDCN {
+    optional MLP backbone = 1;
+    required CrossV2 cross = 2;
+    optional MLP deep = 3;
+    required MLP final = 4;
+    optional MLP din = 5;
+    optional MLP din_encoder = 6;
+    optional uint32 max_seq_length = 7 [default = 0];
+    optional MLP bias = 8;
+    repeated EmbeddingSplitConfig embedding_split = 9;
 }
