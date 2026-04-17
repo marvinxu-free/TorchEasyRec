@@ -13,3 +13,16 @@ message RocketLaunching {
     // COSINE = 0; EUCLID = 1;
     optional Similarity feature_distillation_function = 6 [default=COSINE];
 }
+
+message RocketLaunching2 {
+    optional MLP share_mlp = 1;
+    // Booster: CrossV2 -> Deep MLP (serial)
+    required CrossV2 cross = 2;
+    required MLP deep = 3;
+    // Light: simple MLP (student, learns from booster deep)
+    required MLP light_mlp = 4;
+    // Distillation config
+    optional bool feature_based_distillation = 5 [default = false];
+    // COSINE = 0; EUCLID = 1;
+    optional Similarity feature_distillation_function = 6 [default = COSINE];
+}

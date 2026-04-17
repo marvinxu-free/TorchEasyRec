@@ -134,4 +134,37 @@ message ThreeTowerDCN {
     optional uint32 max_seq_length = 7 [default = 0];
     optional MLP bias = 8;
     repeated EmbeddingSplitConfig embedding_split = 9;
+    optional MLP din_encoder_main = 10;
+    optional MLP din_main = 11;
+}
+
+message CDOT {
+    required uint32 output_dim = 1;
+    optional uint32 mid_dim = 2 [default = 32];
+    repeated uint32 compress_hidden_units = 3;
+}
+
+message VectorProjection {
+    required string feature_name = 1;
+    required uint32 target_dim = 2;
+}
+
+message TowerConfig {
+    required string tower_name = 1;
+    required uint32 dim_size = 2;
+    repeated string feature_names = 3;
+    repeated string sequence_groups = 4;
+    repeated VectorProjection vector_projections = 5;
+    optional MLP din_encoder = 6;
+    optional MLP din = 7;
+}
+
+message VolcanoRank {
+    required MLP deep = 2;
+    required CDOT cdot = 3;
+    optional MLP bias = 4;
+    optional uint32 max_seq_length = 5 [default = 0];
+    optional MLP lhuc_gate = 6;
+    optional bool use_lhuc = 7 [default = false];
+    optional MLP final = 8;
 }

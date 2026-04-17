@@ -41,6 +41,8 @@ message ModelConfig {
 
     repeated FeatureGroupConfig feature_groups = 1;
 
+    repeated TowerConfig tower_feature_configs = 15;
+
     oneof model {
 	    DLRM dlrm = 100;
 	    DeepFM deepfm = 101;
@@ -57,6 +59,7 @@ message ModelConfig {
         xDeepFM2 xdeepfm2 = 121;
         DCNV4 dcn_v4 = 122;
         ThreeTowerDCN three_tower_dcn = 124;
+        VolcanoRank volcano_rank = 125;
 
         SimpleMultiTask simple_multi_task = 200;
         MMoE mmoe = 201;
@@ -74,6 +77,7 @@ message ModelConfig {
         TDM tdm = 400;
 
         RocketLaunching rocket_launching = 500;
+        RocketLaunching2 rocket_launching2 = 501;
         PEPNet pepnet = 206;
     }
 

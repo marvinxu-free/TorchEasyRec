@@ -117,6 +117,8 @@ bias_output (MLP LN)
         └── Concat ──→ Final MLP ──→ Linear(num_class) ──→ prediction
 ```
 
+三塔输出直接拼接后通过 Final MLP 融合。
+
 ## 5. Embedding 隔离策略
 
 ### 5.1 embedding_split 机制

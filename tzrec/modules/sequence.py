@@ -70,6 +70,12 @@ class SequenceEncoder(nn.Module, metaclass=_meta_cls):
 class DINEncoder(SequenceEncoder):
     """DIN sequence encoder.
 
+    When ``sequence_dim > query_dim``, the extra sequence dimensions are
+    split out as auxiliary embeddings and concatenated into the attention
+    input, so that element-wise operations (``queries - sequence``,
+    ``queries * sequence``) only apply to the aligned prefix.  The final
+    weighted-sum still uses the **full** sequence, preserving all features.
+
     Args:
         sequence_dim (int): sequence tensor channel dimension.
         query_dim (int): query tensor channel dimension.
@@ -90,9 +96,11 @@ class DINEncoder(SequenceEncoder):
         super().__init__(input)
         self._query_dim = query_dim
         self._sequence_dim = sequence_dim
-        if self._query_dim != self._sequence_dim:
+        if self._query_dim > self._sequence_dim:
             raise ValueError("query_dim > sequence_dim not supported yet.")
-        self.mlp = MLP(in_features=sequence_dim * 4, dim=3, **attn_mlp)
+        self._aux_dim = max(0, self._sequence_dim - self._query_dim)
+        attn_input_dim = self._query_dim * 4 + self._aux_dim
+        self.mlp = MLP(in_features=attn_input_dim, dim=3, **attn_mlp)
         self.linear = nn.Linear(self.mlp.hidden_units[-1], 1)
         self._query_name = f"{input}.query"
         self._sequence_name = f"{input}.sequence"
@@ -116,13 +124,27 @@ class DINEncoder(SequenceEncoder):
             max_seq_length, device=sequence_length.device
         ).unsqueeze(0) < sequence_length.unsqueeze(1)
 
-        # if self._query_dim < self._sequence_dim:
-        #     query = F.pad(query, (0, self._sequence_dim - self._query_dim))
         queries = query.unsqueeze(1).expand(-1, max_seq_length, -1)
 
-        attn_input = torch.cat(
-            [queries, sequence, queries - sequence, queries * sequence], dim=-1
-        )
+        if self._aux_dim > 0:
+            sequence_main = sequence[:, :, : self._query_dim]
+            sequence_aux = sequence[:, :, self._query_dim :]
+            attn_input = torch.cat(
+                [
+                    queries,
+                    sequence_main,
+                    queries - sequence_main,
+                    queries * sequence_main,
+                    sequence_aux,
+                ],
+                dim=-1,
+            )
+        else:
+            attn_input = torch.cat(
+                [queries, sequence, queries - sequence, queries * sequence],
+                dim=-1,
+            )
+
         attn_output = self.mlp(attn_input)
         attn_output = self.linear(attn_output)
         attn_output = attn_output.transpose(1, 2)
