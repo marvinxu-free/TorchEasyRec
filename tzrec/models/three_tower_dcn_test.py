@@ -279,9 +279,11 @@ class ThreeTowerDCNTest(unittest.TestCase):
         [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
     )
     def test_three_tower_dcn_with_embedding_split(self, graph_type) -> None:
-        """Test ThreeTowerDCN with embedding splitting between towers."""
+        """Test ThreeTowerDCN with embedding splitting and main DIN."""
         # Shared feature between main and bias: embedding_dim doubled
         # Sequence feature between interest and main: embedding_dim doubled
+        # Main tower uses independent DIN (second half), interest uses first half
+        # Interest and bias outputs are Hadamard-multiplied
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
@@ -336,6 +338,8 @@ class ThreeTowerDCNTest(unittest.TestCase):
                 din=module_pb2.MLP(hidden_units=[8, 4]),
                 final=module_pb2.MLP(hidden_units=[4, 2]),
                 bias=module_pb2.MLP(hidden_units=[8, 4]),
+                din_encoder_main=module_pb2.MLP(hidden_units=[8, 4]),
+                din_main=module_pb2.MLP(hidden_units=[8, 4]),
                 embedding_split=[
                     rank_model_pb2.EmbeddingSplitConfig(
                         group_a="main",
