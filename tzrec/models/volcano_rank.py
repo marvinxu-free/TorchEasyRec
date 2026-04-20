@@ -60,7 +60,7 @@ class VolcanoRank(RankModel):
 
         # --- Parse tower configs ---
         self._towers: Dict[str, TowerConfig] = {}
-        for tc in self._model_config.tower_feature_configs:
+        for tc in self._base_model_config.tower_feature_configs:
             self._towers[tc.tower_name] = tc
 
         group_names = self.embedding_group.group_names()
@@ -157,7 +157,7 @@ class VolcanoRank(RankModel):
             self._tower_nonvec_count[tower_name] = nonvec
 
         # --- Vector projection MLPs per tower ---
-        self._vec_mlps: Dict[str, nn.ModuleDict] = {}
+        self._vec_mlps = nn.ModuleDict()
         for tower_name in self._tower_order:
             vec_map = self._tower_vec_projections[tower_name]
             if vec_map:
@@ -183,8 +183,11 @@ class VolcanoRank(RankModel):
             tower_offset = sum(
                 self._towers[t].dim_size
                 for t in self._tower_order[: self._tower_order.index(tower_name)]
-                if t.sequence_groups
-                and any(sg in t.sequence_groups for sg in tc.sequence_groups)
+                if self._towers[t].sequence_groups
+                and any(
+                    sg in self._towers[t].sequence_groups
+                    for sg in tc.sequence_groups
+                )
             )
             # Build query and sequence split ranges for this tower
             for seq_gn in tc.sequence_groups:
@@ -218,9 +221,9 @@ class VolcanoRank(RankModel):
             else 0
         )
 
-        self._din_encoders: Dict[str, nn.ModuleList] = {}
-        self._din_mlps: Dict[str, Optional[MLP]] = {}
-        self._din_lns: Dict[str, Optional[nn.LayerNorm]] = {}
+        self._din_encoders = nn.ModuleDict()
+        self._din_mlps = nn.ModuleDict()
+        self._din_lns = nn.ModuleDict()
         self._din_output_dims: Dict[str, int] = {}
 
         for tower_name in self._tower_order:
@@ -390,7 +393,11 @@ class VolcanoRank(RankModel):
             parts.append(self._split_tensor(main_emb, ranges))
 
         # Vector projections
-        vec_mlps = self._vec_mlps.get(tower_name, {})
+        vec_mlps = (
+            self._vec_mlps[tower_name]
+            if tower_name in self._vec_mlps
+            else {}
+        )
         if vec_mlps:
             offset = 0
             for fname, dim in self._deep_feat_dims.items():
