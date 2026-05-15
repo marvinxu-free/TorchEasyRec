@@ -18,14 +18,18 @@ from tzrec.features import RawFeature
 from tzrec.models.dbmtl_dcnv2 import DBMTL_DCNv2
 from tzrec.protos import feature_pb2
 from tzrec.protos import model_pb2
+from tzrec.protos import module_pb2
 from tzrec.protos.models import multi_task_rank_pb2
+from tzrec.protos.models import rank_model_pb2
+from tzrec.protos.tower_pb2 import RelationType
 
 
 class DBMTL_DCNv2Test(unittest.TestCase):
     """DBMTL_DCNv2 model test."""
 
     def _create_model_config(
-        self, has_bottom_mlp=True, has_mask_net=False, has_mmoe=True
+        self, has_bottom_mlp=True, has_mask_net=False, has_mmoe=True,
+        has_vector_projections=False,
     ) -> model_pb2.ModelConfig:
         """Create model config for testing.
 
@@ -33,6 +37,7 @@ class DBMTL_DCNv2Test(unittest.TestCase):
             has_bottom_mlp: Whether to include bottom_mlp
             has_mask_net: Whether to include mask_net
             has_mmoe: Whether to include MMoE
+            has_vector_projections: Whether to include vector projections
 
         Returns:
             ModelConfig instance
@@ -79,10 +84,17 @@ class DBMTL_DCNv2Test(unittest.TestCase):
         ]
 
         # DCNv2 config (required for DBMTL_DCNv2)
-        dcnv2_config = multi_task_rank_pb2.CrossV2(cross_num=3, low_rank=32)
+        dcnv2_config = module_pb2.CrossV2(cross_num=3, low_rank=32)
 
         # Build dbmtl_dcnv2 config
         dbmtl_dcnv2_config = multi_task_rank_pb2.DBMTL_DCNv2()
+
+        if has_vector_projections:
+            dbmtl_dcnv2_config.vector_projections.append(
+                rank_model_pb2.VectorProjection(
+                    feature_name="f1", target_dim=8,
+                )
+            )
 
         if has_mask_net:
             dbmtl_dcnv2_config.mask_net.CopyFrom(
@@ -127,16 +139,19 @@ class DBMTL_DCNv2Test(unittest.TestCase):
 
     @parameterized.expand(
         [
-            (True, True, True),  # with bottom_mlp, mask_net, mmoe
-            (True, False, True),  # with bottom_mlp, no mask_net, mmoe
-            (False, False, False),  # only dcnv2, no bottom_mlp, no mmoe
+            (True, True, True, False),
+            (True, False, True, False),
+            (False, False, False, False),
+            (True, False, True, True),
         ]
     )
     def test_dbmtl_dcnv2_forward(
-        self, has_bottom_mlp, has_mask_net, has_mmoe
+        self, has_bottom_mlp, has_mask_net, has_mmoe, has_vector_projections
     ):
         """Test DBMTL_DCNv2 forward pass."""
-        config = self._create_model_config(has_bottom_mlp, has_mask_net, has_mmoe)
+        config = self._create_model_config(
+            has_bottom_mlp, has_mask_net, has_mmoe, has_vector_projections
+        )
 
         # Create features (mock data)
         features = [
@@ -157,12 +172,18 @@ class DBMTL_DCNv2Test(unittest.TestCase):
 
         # Check model structure
         self.assertIsNotNone(model.dcnv2, "DCNv2 should be initialized")
-        self.assertEqual(model.dcnv2._cross_num, 3)
+        self.assertEqual(model.dcnv2.cross_num, 3)
         self.assertEqual(model.dcnv2._low_rank, 32)
+
+        # Check LayerNorm
+        self.assertIsNotNone(model.dcnv2_ln, "dcnv2_ln should be initialized")
 
         if has_bottom_mlp:
             self.assertIsNotNone(
                 model.bottom_mlp, "bottom_mlp should be initialized"
+            )
+            self.assertIsNotNone(
+                model.bottom_mlp_ln, "bottom_mlp_ln should be initialized"
             )
 
         if has_mask_net:
@@ -174,6 +195,10 @@ class DBMTL_DCNv2Test(unittest.TestCase):
             self.assertIsNotNone(model.mmoe, "mmoe should be initialized")
             self.assertEqual(model.mmoe._num_expert, 3)
 
+        if has_vector_projections:
+            self.assertEqual(len(model._vec_projections), 1)
+            self.assertIn("f1", model._vec_mlps)
+
         # Check task towers
         self.assertEqual(len(model.task_mlps), 2)
         self.assertIn("is_click", model.task_mlps)
@@ -184,19 +209,44 @@ class DBMTL_DCNv2Test(unittest.TestCase):
 
     def test_dbmtl_dcnv2_with_all_modules(self):
         """Test DBMTL_DCNv2 with all optional modules."""
-        self.test_dbmtl_dcnv2_forward(True, True, True)
+        self.test_dbmtl_dcnv2_forward(True, True, True, False)
 
     def test_dbmtl_dcnv2_without_mask_net(self):
         """Test DBMTL_DCNv2 without mask_net."""
-        self.test_dbmtl_dcnv2_forward(True, False, True)
+        self.test_dbmtl_dcnv2_forward(True, False, True, False)
 
     def test_dbmtl_dcnv2_without_mmoe(self):
         """Test DBMTL_DCNv2 without MMoE."""
-        self.test_dbmtl_dcnv2_forward(True, True, False)
+        self.test_dbmtl_dcnv2_forward(True, True, False, False)
 
     def test_dbmtl_dcnv2_dcnv2_only(self):
         """Test DBMTL_DCNv2 with only DCNv2 branch."""
-        self.test_dbmtl_dcnv2_forward(False, False, False)
+        self.test_dbmtl_dcnv2_forward(False, False, False, False)
+
+    def test_dbmtl_dcnv2_with_vector_projections(self):
+        """Test DBMTL_DCNv2 with vector projection compression."""
+        self.test_dbmtl_dcnv2_forward(True, False, True, True)
+
+    def test_dbmtl_dcnv2_cross_attention_relation(self):
+        """Test DBMTL_DCNv2 with cross-attention task relation."""
+        config = self._create_model_config(
+            has_bottom_mlp=True, has_mask_net=False, has_mmoe=False,
+        )
+        # Set cross-attention relation type on is_click tower
+        for tower_cfg in config.dbmtl_dcnv2.task_towers:
+            if tower_cfg.tower_name == "is_click":
+                tower_cfg.relation_type = RelationType.CROSS_ATTENTION
+                tower_cfg.relation_attn_dim = 32
+
+        features = [
+            RawFeature(feature_name="f1", feature_config=config.feature_configs[0]),
+            RawFeature(feature_name="f2", feature_config=config.feature_configs[1]),
+        ]
+        model = DBMTL_DCNv2(
+            model_config=config, features=features, labels=["is_click", "is_conversion"]
+        )
+        self.assertIn("is_click", model.relation_attns)
+        self.assertEqual(len(model.relation_mlps), 1)
 
 
 if __name__ == "__main__":

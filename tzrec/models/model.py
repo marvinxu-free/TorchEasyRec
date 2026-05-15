@@ -289,6 +289,8 @@ class TrainWrapper(BaseModule):
             losses = self.model.loss(predictions, batch)
             if self.training and self.pareto:
                 total_loss = self.pareto(losses, self.model)
+            elif "total_loss" in losses:
+                total_loss = losses["total_loss"]
             else:
                 total_loss = torch.stack(list(losses.values())).sum()
 

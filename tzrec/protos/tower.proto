@@ -88,6 +88,15 @@ message BayesTaskTower {
     optional float out_task_space_weight = 13 [default = 1.0];
     // use pareto front minimal loss weight, ge 0 and lt 1
     optional float pareto_min_loss_weight = 14 [default = 0.0];
+    // relation type between tasks
+    optional RelationType relation_type = 15 [default = CONCAT];
+    // attention dimension for cross-attention relation (only used when relation_type = CROSS_ATTENTION)
+    optional uint32 relation_attn_dim = 16 [default = 64];
+}
+
+enum RelationType {
+    CONCAT = 0;
+    CROSS_ATTENTION = 1;
 };
 
 message InterventionTaskTower {

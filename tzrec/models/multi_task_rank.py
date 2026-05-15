@@ -16,6 +16,7 @@ import torch
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
+from tzrec.loss.uncertainty_weighting import UncertaintyWeighting
 from tzrec.models.rank_model import RankModel
 from tzrec.modules.utils import div_no_nan
 from tzrec.protos.model_pb2 import ModelConfig
@@ -46,6 +47,15 @@ class MultiTaskRank(RankModel):
         self._use_pareto_loss_weight = model_config.use_pareto_loss_weight
         if self._use_pareto_loss_weight:
             self._pareto_init_weight_cs = []
+
+        self._uncertainty_weighting = None
+        if model_config.HasField("uncertainty_weighting"):
+            uw_cfg = model_config.uncertainty_weighting
+            init_log_vars = list(uw_cfg.init_log_vars) if uw_cfg.init_log_vars else None
+            self._uncertainty_weighting = UncertaintyWeighting(
+                num_tasks=len(self._task_tower_cfgs),
+                init_log_vars=init_log_vars,
+            )
 
     def _multi_task_output_to_prediction(
         self, output: Dict[str, torch.Tensor]
@@ -99,6 +109,12 @@ class MultiTaskRank(RankModel):
     ) -> Dict[str, torch.Tensor]:
         """Compute loss of the model."""
         losses = OrderedDict()
+        if self._uncertainty_weighting is not None:
+            total_loss, per_task_losses = self._uncertainty_loss(predictions, batch)
+            losses["total_loss"] = total_loss
+            losses.update(per_task_losses)
+            losses.update(self._loss_collection)
+            return losses
         for task_tower_cfg in self._task_tower_cfgs:
             tower_name = task_tower_cfg.tower_name
             label_name = task_tower_cfg.label_name
@@ -140,6 +156,37 @@ class MultiTaskRank(RankModel):
                 )
         losses.update(self._loss_collection)
         return losses
+
+    def _uncertainty_loss(
+        self, predictions: Dict[str, torch.Tensor], batch: Batch
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Compute loss with uncertainty weighting.
+
+        Returns:
+            tuple of (total_loss scalar, per_task_losses dict).
+        """
+        per_task_losses = OrderedDict()
+        task_losses = []
+        for task_tower_cfg in self._task_tower_cfgs:
+            tower_name = task_tower_cfg.tower_name
+            label_name = task_tower_cfg.label_name
+            task_loss_sum = torch.tensor(0.0, device=batch.labels[label_name].device)
+            for loss_cfg in task_tower_cfg.losses:
+                per_sample_loss = self._loss_impl(
+                    predictions,
+                    batch,
+                    batch.labels[label_name],
+                    loss_weight=None,
+                    loss_cfg=loss_cfg,
+                    num_class=task_tower_cfg.num_class,
+                    suffix=f"_{tower_name}",
+                )
+                for k, v in per_sample_loss.items():
+                    per_task_losses[k] = v.mean()
+                task_loss_sum += sum(v.mean() for v in per_sample_loss.values())
+            task_losses.append(task_loss_sum)
+        total = self._uncertainty_weighting(task_losses)
+        return total, per_task_losses
 
     def init_metric(self) -> None:
         """Initialize metric modules."""

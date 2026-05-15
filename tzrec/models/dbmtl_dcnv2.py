@@ -23,8 +23,10 @@ from tzrec.modules.masknet import MaskNetModule
 from tzrec.modules.mlp import MLP
 from tzrec.modules.mmoe import MMoE as MMoEModule
 from tzrec.modules.interaction import CrossV2
+from tzrec.modules.task_relation import TaskRelationAttention
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import multi_task_rank_pb2
+from tzrec.protos.tower_pb2 import RelationType
 from tzrec.utils.config_util import config_to_kwargs
 
 
@@ -58,7 +60,28 @@ class DBMTL_DCNv2(MultiTaskRank):
         self._task_tower_cfgs = self._model_config.task_towers
         self.init_input()
         self.group_name = self.embedding_group.group_names()[0]
-        feature_in = self.embedding_group.group_total_dim(self.group_name)
+
+        # Vector projections for compressing high-dimensional features
+        self._feature_dims = self.embedding_group.group_feature_dims(self.group_name)
+        self._vec_projections: Dict[str, int] = {}
+        self._vec_mlps = nn.ModuleDict()
+        for vp in self._model_config.vector_projections:
+            fname = vp.feature_name
+            target_dim = vp.target_dim
+            if fname in self._feature_dims:
+                self._vec_projections[fname] = target_dim
+                self._vec_mlps[fname] = MLP(
+                    self._feature_dims[fname],
+                    hidden_units=[target_dim],
+                    activation="nn.Tanh",
+                )
+
+        raw_feature_in = self.embedding_group.group_total_dim(self.group_name)
+        vec_dim_reduction = sum(
+            self._feature_dims[fname] - target_dim
+            for fname, target_dim in self._vec_projections.items()
+        )
+        feature_in = raw_feature_in - vec_dim_reduction
 
         # MaskNet module (optional)
         self.mask_net = None
@@ -70,18 +93,18 @@ class DBMTL_DCNv2(MultiTaskRank):
 
         # Bottom MLP (optional)
         self.bottom_mlp = None
+        self.bottom_mlp_ln = None
         if self._model_config.HasField("bottom_mlp"):
             self.bottom_mlp = MLP(
                 feature_in, **config_to_kwargs(self._model_config.bottom_mlp)
             )
-            feature_in = self.bottom_mlp.output_dim()
+            self.bottom_mlp_ln = nn.LayerNorm(self.bottom_mlp.output_dim())
 
         # DCNv2 cross module (required for this model)
         self.dcnv2 = CrossV2(
             feature_in, **config_to_kwargs(self._model_config.dcnv2)
         )
-        # DCNv2 output same dimension as input
-        # No need to update feature_in
+        self.dcnv2_ln = nn.LayerNorm(feature_in)
 
         # Calculate input dimension for MMoE (concat of bottom_mlp and dcnv2 outputs)
         mmoe_input_dim = feature_in
@@ -100,6 +123,8 @@ class DBMTL_DCNv2(MultiTaskRank):
                 else None,
             )
             feature_in = self.mmoe.output_dim()
+        else:
+            feature_in = mmoe_input_dim
 
         # Task towers
         self.task_mlps = nn.ModuleDict()
@@ -110,28 +135,43 @@ class DBMTL_DCNv2(MultiTaskRank):
 
         # Relation MLPs for Bayesian task towers
         self.relation_mlps = nn.ModuleDict()
+        self.relation_attns = nn.ModuleDict()
         for task_tower_cfg in self._task_tower_cfgs:
             tower_name = task_tower_cfg.tower_name
             if task_tower_cfg.HasField("relation_mlp"):
-                if tower_name in self.task_mlps:
-                    relation_input_dim = self.task_mlps[tower_name].output_dim()
-                else:
-                    relation_input_dim = feature_in
-                for relation_tower_name in task_tower_cfg.relation_tower_names:
-                    if relation_tower_name in self.relation_mlps:
-                        relation_input_dim += self.relation_mlps[
-                            relation_tower_name
-                        ].output_dim()
-                    elif relation_tower_name in self.task_mlps:
-                        relation_input_dim += self.task_mlps[
-                            relation_tower_name
-                        ].output_dim()
+                use_cross_attn = (
+                    task_tower_cfg.relation_type == RelationType.CROSS_ATTENTION
+                )
+                if use_cross_attn:
+                    if tower_name in self.task_mlps:
+                        task_dim = self.task_mlps[tower_name].output_dim()
                     else:
-                        relation_input_dim += feature_in
+                        task_dim = feature_in
+                    attn_dim = task_tower_cfg.relation_attn_dim
+                    self.relation_attns[tower_name] = TaskRelationAttention(
+                        task_dim, attn_dim
+                    )
+                    relation_input_dim = task_dim * 2
+                else:
+                    if tower_name in self.task_mlps:
+                        relation_input_dim = self.task_mlps[tower_name].output_dim()
+                    else:
+                        relation_input_dim = feature_in
+                    for relation_tower_name in task_tower_cfg.relation_tower_names:
+                        if relation_tower_name in self.relation_mlps:
+                            relation_input_dim += self.relation_mlps[
+                                relation_tower_name
+                            ].output_dim()
+                        elif relation_tower_name in self.task_mlps:
+                            relation_input_dim += self.task_mlps[
+                                relation_tower_name
+                            ].output_dim()
+                        else:
+                            relation_input_dim += feature_in
                 relation_mlp = MLP(
                     relation_input_dim, **config_to_kwargs(task_tower_cfg.relation_mlp)
                 )
-                self.relation_mlps[task_tower_cfg.tower_name] = relation_mlp
+                self.relation_mlps[tower_name] = relation_mlp
 
         # Task output layers
         self.task_outputs = nn.ModuleList()
@@ -145,6 +185,17 @@ class DBMTL_DCNv2(MultiTaskRank):
                 input_dim = feature_in
             self.task_outputs.append(nn.Linear(input_dim, task_tower_cfg.num_class))
 
+    def _apply_vector_projections(self, net: torch.Tensor) -> torch.Tensor:
+        parts = []
+        offset = 0
+        for fname, dim in self._feature_dims.items():
+            feat_slice = net[:, offset : offset + dim]
+            if fname in self._vec_mlps:
+                feat_slice = self._vec_mlps[fname](feat_slice)
+            parts.append(feat_slice)
+            offset += dim
+        return torch.cat(parts, dim=-1)
+
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Forward the model.
 
@@ -157,6 +208,11 @@ class DBMTL_DCNv2(MultiTaskRank):
         grouped_features = self.build_input(batch)
 
         net = grouped_features[self.group_name]
+
+        # Compress high-dimensional vector features
+        if self._vec_projections:
+            net = self._apply_vector_projections(net)
+
         if self.mask_net is not None:
             net = self.mask_net(net)
 
@@ -164,18 +220,14 @@ class DBMTL_DCNv2(MultiTaskRank):
         parallel_outputs = []
         if self.bottom_mlp is not None:
             bottom_out = self.bottom_mlp(net)
+            bottom_out = self.bottom_mlp_ln(bottom_out)
             parallel_outputs.append(bottom_out)
 
-        # DCNv2 is always present in this model
         dcnv2_out = self.dcnv2(net)
+        dcnv2_out = self.dcnv2_ln(dcnv2_out)
         parallel_outputs.append(dcnv2_out)
 
-        # Concat parallel outputs
-        if len(parallel_outputs) > 0:
-            net = torch.cat(parallel_outputs, dim=-1)
-        else:
-            # If no bottom_mlp, use dcnv2 output only
-            net = dcnv2_out
+        net = torch.cat(parallel_outputs, dim=-1)
 
         if self.mmoe is not None:
             task_input_list = self.mmoe(net)
@@ -194,10 +246,27 @@ class DBMTL_DCNv2(MultiTaskRank):
         for task_tower_cfg in self._task_tower_cfgs:
             tower_name = task_tower_cfg.tower_name
             if task_tower_cfg.HasField("relation_mlp"):
-                relation_input_net = [task_net[tower_name]]
-                for relation_tower_name in task_tower_cfg.relation_tower_names:
-                    relation_input_net.append(relation_net[relation_tower_name])
-                relation_input_net = torch.cat(relation_input_net, dim=1)
+                use_cross_attn = (
+                    task_tower_cfg.relation_type == RelationType.CROSS_ATTENTION
+                )
+                if use_cross_attn:
+                    related_input = torch.cat(
+                        [relation_net[rn] for rn in task_tower_cfg.relation_tower_names],
+                        dim=1,
+                    )
+                    attn_out = self.relation_attns[tower_name](
+                        query=task_net[tower_name],
+                        key=related_input,
+                        value=related_input,
+                    )
+                    relation_input_net = torch.cat(
+                        [attn_out, task_net[tower_name]], dim=1
+                    )
+                else:
+                    relation_input_net = [task_net[tower_name]]
+                    for relation_tower_name in task_tower_cfg.relation_tower_names:
+                        relation_input_net.append(relation_net[relation_tower_name])
+                    relation_input_net = torch.cat(relation_input_net, dim=1)
                 relation_net[tower_name] = self.relation_mlps[tower_name](
                     relation_input_net
                 )

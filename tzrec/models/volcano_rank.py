@@ -107,6 +107,20 @@ class VolcanoRank(RankModel):
         self._bias_tc_features = set(bias_tc.feature_names) if bias_tc else set()
         self._lhuc_tc_features = set(lhuc_tc.feature_names) if lhuc_tc else set()
 
+        # Validate embedding_dim vs tower requirements.
+        for fname, actual_dim in self._deep_feat_dims.items():
+            required_dim = sum(
+                self._towers[t].dim_size
+                for t in ["deep", "cdot", "bias", "lhuc"]
+                if t in self._towers and fname in set(self._towers[t].feature_names)
+            )
+            if required_dim > 0 and actual_dim < required_dim:
+                raise ValueError(
+                    f"Feature '{fname}': embedding_dim={actual_dim} < "
+                    f"required {required_dim} (sum of tower dim_sizes). "
+                    f"Please update embedding_dim in feature_configs."
+                )
+
         # For each feature, compute which towers use it to determine offsets.
         # Tower order: deep, cdot, bias, lhuc (fixed by dim_size config).
         self._tower_order = []
@@ -116,24 +130,31 @@ class VolcanoRank(RankModel):
 
         # Build split ranges per tower: for each feature the tower uses,
         # extract [tower_offset : tower_offset + dim_size] from the feature's
-        # embedding_dim-sized slice.
+        # embedding_dim-sized slice. The tower_offset is per-feature: only
+        # towers that come before this one AND also use this feature contribute.
         self._tower_split_ranges: Dict[str, List[Tuple[int, int]]] = {}
         for tower_name in self._tower_order:
             tc = self._towers[tower_name]
             tower_feat_set = set(tc.feature_names)
             tower_dim = tc.dim_size
-            # Compute offset of this tower within the shared embedding
-            tower_offset = sum(
-                self._towers[t].dim_size
-                for t in self._tower_order[: self._tower_order.index(tower_name)]
-            )
+            tower_idx = self._tower_order.index(tower_name)
             ranges = []
             offset = 0
             for fname, dim in self._deep_feat_dims.items():
                 if fname in tower_feat_set:
-                    ranges.append(
-                        (offset + tower_offset, offset + tower_offset + tower_dim)
+                    # Per-feature offset: sum of dim_sizes of preceding
+                    # towers that also use this feature.
+                    feat_offset = sum(
+                        self._towers[t].dim_size
+                        for t in self._tower_order[:tower_idx]
+                        if fname in set(self._towers[t].feature_names)
                     )
+                    if dim >= feat_offset + tower_dim:
+                        ranges.append(
+                            (offset + feat_offset, offset + feat_offset + tower_dim)
+                        )
+                    else:
+                        ranges.append((offset, offset + dim))
                 offset += dim
             self._tower_split_ranges[tower_name] = ranges
 
@@ -174,38 +195,49 @@ class VolcanoRank(RankModel):
         # --- Sequence split ranges ---
         # Sequence features shared between towers using them.
         # emb_dim per seq feature = sum of dim_sizes of towers with that seq_group.
+        # Features with dim < tower_offset + tower_dim (e.g., __ts timestamp)
+        # are not split by tower — they keep their full dim.
         self._seq_tower_split: Dict[str, Dict[str, List[Tuple[int, int]]]] = {}
         for tower_name in self._tower_order:
             tc = self._towers[tower_name]
             if not tc.sequence_groups:
                 continue
             tower_dim = tc.dim_size
-            tower_offset = sum(
-                self._towers[t].dim_size
-                for t in self._tower_order[: self._tower_order.index(tower_name)]
-                if self._towers[t].sequence_groups
-                and any(
-                    sg in self._towers[t].sequence_groups
-                    for sg in tc.sequence_groups
-                )
-            )
+            # Per-seq-group offset: sum of dim_sizes of preceding towers
+            # that also use this sequence group.
+            tower_idx = self._tower_order.index(tower_name)
             # Build query and sequence split ranges for this tower
             for seq_gn in tc.sequence_groups:
                 query_dims = self.embedding_group.group_dims(f"{seq_gn}.query")
                 seq_dims = self.embedding_group.group_dims(f"{seq_gn}.sequence")
+                # Compute per-feature offset for this seq group
+                seq_tower_offset = sum(
+                    self._towers[t].dim_size
+                    for t in self._tower_order[:tower_idx]
+                    if self._towers[t].sequence_groups
+                    and seq_gn in self._towers[t].sequence_groups
+                )
                 q_ranges = []
                 off = 0
                 for d in query_dims:
-                    q_ranges.append(
-                        (off + tower_offset, off + tower_offset + tower_dim)
-                    )
+                    if d >= seq_tower_offset + tower_dim:
+                        q_ranges.append(
+                            (off + seq_tower_offset,
+                             off + seq_tower_offset + tower_dim)
+                        )
+                    else:
+                        q_ranges.append((off, off + d))
                     off += d
                 s_ranges = []
                 off = 0
                 for d in seq_dims:
-                    s_ranges.append(
-                        (off + tower_offset, off + tower_offset + tower_dim)
-                    )
+                    if d >= seq_tower_offset + tower_dim:
+                        s_ranges.append(
+                            (off + seq_tower_offset,
+                             off + seq_tower_offset + tower_dim)
+                        )
+                    else:
+                        s_ranges.append((off, off + d))
                     off += d
                 if seq_gn not in self._seq_tower_split:
                     self._seq_tower_split[seq_gn] = {}
@@ -236,6 +268,13 @@ class VolcanoRank(RankModel):
             for seq_gn in tc.sequence_groups:
                 seq_dim = self.embedding_group.group_total_dim(f"{seq_gn}.sequence")
                 query_dim = self.embedding_group.group_total_dim(f"{seq_gn}.query")
+                # Use tower-specific dims from split ranges
+                seq_split = self._seq_tower_split.get(
+                    seq_gn, {}
+                ).get(tower_name)
+                if seq_split:
+                    query_dim = sum(e - s for s, e in seq_split["query"])
+                    seq_dim = sum(e - s for s, e in seq_split["sequence"])
                 enc = DINEncoder(
                     sequence_dim=seq_dim,
                     query_dim=query_dim,

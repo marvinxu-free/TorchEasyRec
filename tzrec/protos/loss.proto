@@ -31,3 +31,9 @@ message BinaryFocalLoss {
     optional float gamma = 1 [default = 2.0];
     optional float alpha = 2 [default = 0.5];
 }
+
+message UncertaintyWeighting {
+    // initial log variance for each task (one per task tower).
+    // if not set, defaults to 0.0 for all tasks.
+    repeated float init_log_vars = 1;
+}

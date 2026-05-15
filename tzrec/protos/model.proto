@@ -90,6 +90,8 @@ message ModelConfig {
         // SID generation models
         // (600 is reserved for SidRqvae, arriving in the follow-up PR)
         SidRqkmeans sid_rqkmeans = 601;
+
+        DBMTL_DCNv2 dbmtl_dcnv2 = 208;
     }
 
     optional uint32 num_class = 2 [default = 1];
@@ -106,5 +108,8 @@ message ModelConfig {
 
     // whether use pareto loss weight
     optional bool use_pareto_loss_weight = 13 [default = false];
+
+    // uncertainty weighting for multi-task loss
+    optional UncertaintyWeighting uncertainty_weighting = 14;
 
 }
