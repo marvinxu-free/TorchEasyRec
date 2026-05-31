@@ -52,6 +52,8 @@ message DBMTL_DCNv2 {
     repeated BayesTaskTower task_towers = 7;
     // vector projections for compressing high-dimensional features
     repeated VectorProjection vector_projections = 8;
+    // 概率排序约束惩罚权重（p(parent) >= p(child)），0 表示不启用
+    optional float ordering_penalty_weight = 9 [default = 0.0];
 }
 
 message DC2VR {

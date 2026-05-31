@@ -159,6 +159,11 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
         """
         return
 
+    def reset_train_metric(self) -> None:
+        """Reset train metric modules."""
+        for metric in self._train_metric_modules.values():
+            metric.reset()
+
     def sparse_parameters(
         self,
     ) -> Tuple[Iterable[nn.Parameter], Iterable[nn.Parameter]]:

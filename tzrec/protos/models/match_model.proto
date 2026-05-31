@@ -81,3 +81,21 @@ message MIND {
     optional float temperature = 6 [default = 1.0];
     required int32 output_dim = 7;
 }
+
+
+message RocketLaunchingMatch {
+    // Light tower 配置（推理时使用）
+    required Tower user_tower = 1;
+    required Tower item_tower = 2;
+    // user and item tower output embedding dimension
+    required int32 output_dim = 3;
+    optional Similarity similarity = 4 [default=INNER_PRODUCT];
+    optional float temperature = 5 [default = 1.0];
+    optional bool in_batch_negative = 6 [default = false];
+
+    // Booster tower 配置（训练时使用，每个 tower 独立实例化）
+    required CrossV2 cross = 10;
+    required MLP deep = 11;
+    optional bool feature_based_distillation = 12 [default = false];
+    optional Similarity feature_distillation_function = 13 [default=COSINE];
+}

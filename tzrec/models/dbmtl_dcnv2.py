@@ -280,3 +280,24 @@ class DBMTL_DCNv2(MultiTaskRank):
             tower_outputs[tower_name] = tower_output
 
         return self._multi_task_output_to_prediction(tower_outputs)
+
+    def loss(
+        self, predictions: Dict[str, torch.Tensor], batch: Batch
+    ) -> Dict[str, torch.Tensor]:
+        """Compute loss with optional ordering penalty."""
+        losses = super().loss(predictions, batch)
+        penalty_weight = self._model_config.ordering_penalty_weight
+        if penalty_weight > 0:
+            for task_tower_cfg in self._task_tower_cfgs:
+                if task_tower_cfg.relation_tower_names:
+                    child_name = task_tower_cfg.tower_name
+                    parent_name = task_tower_cfg.relation_tower_names[0]
+                    parent_prob = predictions[f"probs_{parent_name}"]
+                    child_prob = predictions[f"probs_{child_name}"]
+                    child_label = batch.labels[task_tower_cfg.label_name]
+                    violations = torch.relu(child_prob - parent_prob) * child_label
+                    num_violations = (violations > 0).sum().clamp(min=1)
+                    losses["ordering_penalty"] = (
+                        penalty_weight * violations.sum() / num_violations
+                    )
+        return losses

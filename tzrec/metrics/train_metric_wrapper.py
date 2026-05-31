@@ -60,3 +60,10 @@ class TrainMetricWrapper(nn.Module):
     def compute(self) -> Tensor:
         """Get metric value."""
         return self._value.data
+
+    def reset(self) -> None:
+        """Reset wrapper and underlying metric to initial state."""
+        self._metric_module.reset()
+        self._value.data.fill_(0.0)
+        self._step_total_value.data.fill_(0.0)
+        self._step_cnt.data.fill_(0)

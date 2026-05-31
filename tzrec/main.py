@@ -437,6 +437,8 @@ def _train_and_evaluate(
 
         train_iterator = iter(train_dataloader)
 
+        _model.reset_train_metric()
+
         # Restore model and optimizer checkpoint
         if i_step == 0 and ckpt_path is not None:
             if ignore_restore_optimizer:
