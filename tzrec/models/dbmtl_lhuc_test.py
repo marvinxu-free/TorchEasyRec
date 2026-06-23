@@ -193,6 +193,14 @@ class DBMTL_LHUCTest(unittest.TestCase):
         # No cross-attention modules
         self.assertEqual(len(model.relation_attns), 0)
 
+        # Task output layers keyed by tower_name (ModuleDict, not ModuleList)
+        self.assertIsInstance(model.task_outputs, torch.nn.ModuleDict)
+        self.assertEqual(len(model.task_outputs), len(model._task_tower_cfgs))
+        self.assertIn("is_click", model.task_outputs)
+        self.assertIn("is_conversion", model.task_outputs)
+        self.assertEqual(model.task_outputs["is_click"].out_features, 2)
+        self.assertEqual(model.task_outputs["is_conversion"].out_features, 2)
+
     def test_dbmtl_lhuc_with_all_modules(self):
         """Test DBMTL_LHUC with all optional modules."""
         self.test_dbmtl_lhuc_structure(True, True, True, True, False)

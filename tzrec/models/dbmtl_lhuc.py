@@ -214,8 +214,9 @@ class DBMTL_LHUC(MultiTaskRank):
                 )
                 self.relation_mlps[tower_name] = relation_mlp
 
-        # Task output layers
-        self.task_outputs = nn.ModuleList()
+        # Task output layers (keyed by tower_name so per-tower dense LR can
+        # target them via a stable regex, independent of task_towers order)
+        self.task_outputs = nn.ModuleDict()
         for task_tower_cfg in self._task_tower_cfgs:
             tower_name = task_tower_cfg.tower_name
             if tower_name in self.relation_mlps:
@@ -224,7 +225,9 @@ class DBMTL_LHUC(MultiTaskRank):
                 input_dim = self.task_mlps[tower_name].output_dim()
             else:
                 input_dim = feature_in
-            self.task_outputs.append(nn.Linear(input_dim, task_tower_cfg.num_class))
+            self.task_outputs[tower_name] = nn.Linear(
+                input_dim, task_tower_cfg.num_class
+            )
 
     def _extract_bias_features(self, net: torch.Tensor) -> torch.Tensor:
         """Extract and concatenate bias feature embeddings from grouped features."""
@@ -307,9 +310,9 @@ class DBMTL_LHUC(MultiTaskRank):
                 relation_net[tower_name] = task_net[tower_name]
 
         tower_outputs = {}
-        for i, task_tower_cfg in enumerate(self._task_tower_cfgs):
+        for task_tower_cfg in self._task_tower_cfgs:
             tower_name = task_tower_cfg.tower_name
-            tower_output = self.task_outputs[i](relation_net[tower_name])
+            tower_output = self.task_outputs[tower_name](relation_net[tower_name])
             tower_outputs[tower_name] = tower_output
 
         return self._multi_task_output_to_prediction(tower_outputs)
