@@ -49,9 +49,9 @@ def _compute_fused_weight(
     names = list(swf.weight_names)
     coeffs = list(swf.weight_coeffs)
     assert names, "sample_weight_fusion.weight_names must not be empty"
-    assert len(names) == len(coeffs), (
-        f"weight_names({len(names)}) and weight_coeffs({len(coeffs)}) length mismatch"
-    )
+    assert len(names) == len(
+        coeffs
+    ), f"weight_names({len(names)}) and weight_coeffs({len(coeffs)}) length mismatch"
     fused_weight = torch.zeros_like(sample_weights[names[0]])
     for name, coeff in zip(names, coeffs):
         w = sample_weights[name]
@@ -151,9 +151,7 @@ class DBMTL_LHUC(MultiTaskRank):
                 gate_input_dim=bias_dim,
                 hidden_units=list(pp_cfg.hidden_units),
                 lhuc_hidden_units=(
-                    list(pp_cfg.lhuc_hidden_units)
-                    if pp_cfg.lhuc_hidden_units
-                    else None
+                    list(pp_cfg.lhuc_hidden_units) if pp_cfg.lhuc_hidden_units else None
                 ),
                 activation=pp_cfg.activation or "nn.ReLU",
                 scale_last=pp_cfg.scale_last,
@@ -229,6 +227,46 @@ class DBMTL_LHUC(MultiTaskRank):
                 input_dim, task_tower_cfg.num_class
             )
 
+        # Bias auxiliary task heads (predict bias fields as labels).
+        # Each branches from its target_tower's representation (task_net[target])
+        # WITHOUT modifying that tower's logit — pure auxiliary regression.
+        self._bias_task_cfgs = list(self._model_config.bias_tasks)
+        self.bias_mlps = nn.ModuleDict()
+        self.bias_outputs = nn.ModuleDict()
+        tower_names = [t.tower_name for t in self._task_tower_cfgs]
+        for bias_cfg in self._bias_task_cfgs:
+            name = bias_cfg.name
+            target = bias_cfg.target_tower
+            assert target in tower_names, (
+                f"bias_task '{name}' target_tower '{target}' "
+                f"not in task_towers {tower_names}"
+            )
+            # input dim mirrors task_net[target] in predict()
+            bias_in_dim = (
+                self.task_mlps[target].output_dim()
+                if target in self.task_mlps
+                else feature_in
+            )
+            if bias_cfg.HasField("mlp"):
+                bias_mlp = MLP(bias_in_dim, **config_to_kwargs(bias_cfg.mlp))
+                out_dim = bias_mlp.output_dim()
+                self.bias_mlps[name] = bias_mlp
+            else:
+                out_dim = bias_in_dim
+            # single scalar output per sample, squeezed to [B] in predict()
+            self.bias_outputs[name] = nn.Linear(out_dim, 1)
+
+    def init_loss(self) -> None:
+        """Initialize task tower losses and bias auxiliary task losses."""
+        super().init_loss()
+        for bias_cfg in self._bias_task_cfgs:
+            self._init_loss_impl(
+                bias_cfg.loss,
+                num_class=bias_cfg.num_class,
+                reduction="mean",
+                suffix=f"_bias_{bias_cfg.name}",
+            )
+
     def _extract_bias_features(self, net: torch.Tensor) -> torch.Tensor:
         """Extract and concatenate bias feature embeddings from grouped features."""
         parts = []
@@ -295,6 +333,21 @@ class DBMTL_LHUC(MultiTaskRank):
             else:
                 task_net[tower_name] = task_input_list[i]
 
+        # Bias auxiliary task predictions (branch from target_tower's
+        # representation). Does NOT modify tower logits — auxiliary
+        # regression/classification only.
+        bias_predictions: Dict[str, torch.Tensor] = {}
+        for bias_cfg in self._bias_task_cfgs:
+            name = bias_cfg.name
+            rep = task_net[bias_cfg.target_tower]
+            h = self.bias_mlps[name](rep) if name in self.bias_mlps else rep
+            pred = self.bias_outputs[name](h).squeeze(-1)  # [B]
+            loss_type = bias_cfg.loss.WhichOneof("loss")
+            if loss_type == "l2_loss":
+                bias_predictions[f"y_bias_{name}"] = pred
+            else:  # binary_cross_entropy / softmax_cross_entropy / ... use logits
+                bias_predictions[f"logits_bias_{name}"] = pred
+
         relation_net = {}
         for task_tower_cfg in self._task_tower_cfgs:
             tower_name = task_tower_cfg.tower_name
@@ -315,17 +368,20 @@ class DBMTL_LHUC(MultiTaskRank):
             tower_output = self.task_outputs[tower_name](relation_net[tower_name])
             tower_outputs[tower_name] = tower_output
 
-        return self._multi_task_output_to_prediction(tower_outputs)
+        predictions = self._multi_task_output_to_prediction(tower_outputs)
+        predictions.update(bias_predictions)
+        return predictions
 
     def loss(
         self, predictions: Dict[str, torch.Tensor], batch: Batch
     ) -> Dict[str, torch.Tensor]:
-        """Compute loss with sample weight fusion and price monotonicity.
+        """Compute loss with sample weight fusion and bias auxiliary tasks.
 
         When sample_weight_fusion is configured, per-sample fused weights
         (linear combination of N configured weight fields, each normalized
         by its own mean) are applied to per-sample losses BEFORE mean
-        reduction, preserving per-sample weighting semantics.
+        reduction, preserving per-sample weighting semantics. Auxiliary bias
+        task losses (bias fields as labels) are added on top.
         """
         use_fused_weight = self._model_config.HasField("sample_weight_fusion")
 
@@ -356,18 +412,32 @@ class DBMTL_LHUC(MultiTaskRank):
         else:
             losses = super().loss(predictions, batch)
 
-        # Price monotonicity penalty: higher price → lower CTR/CVR
-        mono_weight = self._model_config.price_monotonicity_weight
-        if mono_weight > 0:
-            pw_name = self._model_config.price_weight_name
-            price_weight = batch.sample_weights[pw_name]
-            penalty_per_sample = torch.zeros_like(price_weight)
-            for task_tower_cfg in self._task_tower_cfgs:
-                tower_name = task_tower_cfg.tower_name
-                prob = predictions[f"probs_{tower_name}"]
-                penalty_per_sample = penalty_per_sample + torch.relu(
-                    prob * price_weight
-                ).squeeze(-1)
-            losses["price_monotonicity"] = mono_weight * penalty_per_sample.mean()
+        losses.update(self._compute_bias_losses(predictions, batch))
 
         return losses
+
+    def _compute_bias_losses(
+        self, predictions: Dict[str, torch.Tensor], batch: Batch
+    ) -> Dict[str, torch.Tensor]:
+        """Compute auxiliary bias task losses (bias fields as labels).
+
+        Each bias task supervises its target_field value with its configured
+        loss; bias heads do NOT modify the main task logits — these are
+        auxiliary signals only.
+        """
+        bias_losses = OrderedDict()
+        for bias_cfg in self._bias_task_cfgs:
+            name = bias_cfg.name
+            target = batch.sample_weights[bias_cfg.target_field]
+            bl = self._loss_impl(
+                predictions,
+                batch,
+                target,
+                loss_weight=None,
+                loss_cfg=bias_cfg.loss,
+                num_class=bias_cfg.num_class,
+                suffix=f"_bias_{name}",
+            )
+            for k, v in bl.items():
+                bias_losses[k] = v * bias_cfg.weight
+        return bias_losses
