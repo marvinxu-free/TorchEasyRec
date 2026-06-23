@@ -3,6 +3,7 @@ package tzrec.protos;
 
 import "tzrec/protos/module.proto";
 import "tzrec/protos/tower.proto";
+import "tzrec/protos/loss.proto";
 import "tzrec/protos/models/rank_model.proto";
 
 message SimpleMultiTask {
@@ -83,6 +84,25 @@ message SampleWeightFusion {
     repeated float weight_coeffs = 2;
 }
 
+message BiasTask {
+    // bias task name, used as prediction/loss key suffix (_bias_<name>)
+    required string name = 1;
+    // which task tower's representation the bias head branches from
+    // (e.g. item_trend_bias -> is_click, price_bias -> is_conversion)
+    required string target_tower = 2;
+    // sample_weight field used as the supervision target (must be in
+    // data_config.sample_weight_fields)
+    required string target_field = 3;
+    // bias head MLP (input = target_tower's representation)
+    optional MLP mlp = 4;
+    // loss for the bias task (l2_loss / binary_cross_entropy / ...)
+    required LossConfig loss = 5;
+    // loss weight
+    optional float weight = 6 [default = 1.0];
+    // output classes (1 for regression/L2, 2 for binary BCE)
+    optional uint32 num_class = 7 [default = 1];
+}
+
 message DBMTL_LHUC {
     // shared bottom MaskNet module
     optional MaskNetModule mask_net = 1;
@@ -104,10 +124,8 @@ message DBMTL_LHUC {
     optional LHUCPPNetConfig lhuc_pp_net = 12;
     // sample weight fusion config
     optional SampleWeightFusion sample_weight_fusion = 9;
-    // price monotonicity penalty weight, 0 to disable
-    optional float price_monotonicity_weight = 10 [default = 0.0];
-    // price weight field name in sample_weight_fields
-    optional string price_weight_name = 11 [default = "price_weight"];
+    // extensible bias auxiliary tasks (predict bias fields as labels)
+    repeated BiasTask bias_tasks = 13;
 }
 
 message DC2VR {
