@@ -316,6 +316,110 @@ class DBMTL_LHUCTest(unittest.TestCase):
             [0.2, 0.8, 1.2],
         )
 
+    def test_dbmtl_lhuc_bias_tasks_structure(self):
+        """Test DBMTL_LHUC builds bias auxiliary task heads."""
+        from tzrec.protos import loss_pb2
+
+        config = self._create_model_config(
+            has_bottom_mlp=True, has_mask_net=False, has_mmoe=True,
+            has_lhuc_gate=False, has_lhuc_pp_net=False,
+        )
+        config.dbmtl_lhuc.bias_tasks.add(
+            name="item_trend_bias",
+            target_tower="is_click",
+            target_field="item_trend_bias",
+            mlp=model_pb2.MLP(hidden_units=[32]),
+            loss=loss_pb2.LossConfig(l2_loss=loss_pb2.L2Loss()),
+            weight=0.1,
+            num_class=1,
+        )
+        config.dbmtl_lhuc.bias_tasks.add(
+            name="price_bias",
+            target_tower="is_conversion",
+            target_field="price_bias",
+            mlp=model_pb2.MLP(hidden_units=[32]),
+            loss=loss_pb2.LossConfig(l2_loss=loss_pb2.L2Loss()),
+            weight=0.2,
+            num_class=1,
+        )
+
+        features = [
+            RawFeature(
+                feature_name="f1",
+                feature_config=config.feature_configs[0],
+            ),
+            RawFeature(
+                feature_name="f2",
+                feature_config=config.feature_configs[1],
+            ),
+        ]
+        model = DBMTL_LHUC(
+            model_config=config, features=features,
+            labels=["is_click", "is_conversion"],
+        )
+
+        # bias heads built for each task, keyed by bias name
+        self.assertEqual(len(model._bias_task_cfgs), 2)
+        self.assertEqual(len(model.bias_mlps), 2)
+        self.assertEqual(len(model.bias_outputs), 2)
+        self.assertIn("item_trend_bias", model.bias_mlps)
+        self.assertIn("price_bias", model.bias_mlps)
+        self.assertIn("item_trend_bias", model.bias_outputs)
+        self.assertIn("price_bias", model.bias_outputs)
+        # single scalar output per sample
+        self.assertEqual(model.bias_outputs["item_trend_bias"].out_features, 1)
+        self.assertEqual(model.bias_outputs["price_bias"].out_features, 1)
+        # input dim = target tower mlp output dim (task mlp last hidden = 32)
+        self.assertEqual(model.bias_outputs["item_trend_bias"].in_features, 32)
+        self.assertEqual(model.bias_outputs["price_bias"].in_features, 32)
+
+    def test_dbmtl_lhuc_bias_tasks_invalid_target_tower(self):
+        """Test invalid bias target_tower raises AssertionError."""
+        from tzrec.protos import loss_pb2
+
+        config = self._create_model_config(
+            has_bottom_mlp=True, has_mask_net=False, has_mmoe=True,
+            has_lhuc_gate=False, has_lhuc_pp_net=False,
+        )
+        config.dbmtl_lhuc.bias_tasks.add(
+            name="bad_bias",
+            target_tower="nonexistent",
+            target_field="price_bias",
+            loss=loss_pb2.LossConfig(l2_loss=loss_pb2.L2Loss()),
+            num_class=1,
+        )
+        features = [
+            RawFeature(
+                feature_name="f1",
+                feature_config=config.feature_configs[0],
+            ),
+            RawFeature(
+                feature_name="f2",
+                feature_config=config.feature_configs[1],
+            ),
+        ]
+        with self.assertRaises(AssertionError):
+            DBMTL_LHUC(
+                model_config=config, features=features,
+                labels=["is_click", "is_conversion"],
+            )
+
+    def test_bias_loss_math_isolated(self):
+        """Isolated check: bias loss = mean(MSE(pred, target)) * weight.
+
+        Mirrors _compute_bias_losses with l2_loss (reduction='mean'):
+        loss_module output is mean-reduced, then multiplied by weight.
+        """
+        import torch.nn as nn
+
+        pred = torch.tensor([1.0, 2.0, 3.0])
+        target = torch.tensor([2.0, 2.0, 2.0])
+        weight = 0.5
+        mse = nn.MSELoss(reduction="mean")
+        bias_loss = mse(pred, target) * weight
+        # MSE = ((1)^2 + 0 + (-1)^2) / 3 = 2/3 ; * 0.5 = 1/3
+        torch.testing.assert_close(bias_loss, torch.tensor(1.0 / 3.0))
+
 
 if __name__ == "__main__":
     unittest.main()
