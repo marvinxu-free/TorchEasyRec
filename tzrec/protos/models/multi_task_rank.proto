@@ -56,6 +56,60 @@ message DBMTL_DCNv2 {
     optional float ordering_penalty_weight = 9 [default = 0.0];
 }
 
+message LHUCEPGateConfig {
+    // feature names whose embeddings are used as gate input
+    repeated string bias_feature_names = 1;
+    // hidden units for gate MLP
+    repeated uint32 hidden_units = 2;
+}
+
+message LHUCPPNetConfig {
+    // PP net main network layer sizes (nn_dims)
+    repeated uint32 hidden_units = 1;
+    // gate MLP hidden layer sizes (lhuc_dims)
+    repeated uint32 lhuc_hidden_units = 2;
+    // activation function for nn layers
+    optional string activation = 3 [default = "nn.ReLU"];
+    // whether to apply additional sigmoid gating to last layer output
+    optional bool scale_last = 4 [default = false];
+    // dropout ratio
+    optional float dropout_ratio = 5 [default = 0.0];
+}
+
+message SampleWeightFusion {
+    // sample weight field names to fuse; must be a subset of sample_weight_fields
+    repeated string weight_names = 1;
+    // fusion coefficient per weight_name; length must match weight_names
+    repeated float weight_coeffs = 2;
+}
+
+message DBMTL_LHUC {
+    // shared bottom MaskNet module
+    optional MaskNetModule mask_net = 1;
+    // shared bottom mlp layer
+    optional MLP bottom_mlp = 2;
+    // DCNv2 cross module
+    required CrossV2 dcnv2 = 3;
+    // mmoe expert mlp layer definition
+    optional MLP expert_mlp = 4;
+    // mmoe gate module definition
+    optional MLP gate_mlp = 5;
+    // number of mmoe experts
+    optional uint32 num_expert = 6 [default=3];
+    // bayes task tower
+    repeated BayesTaskTower task_towers = 7;
+    // LHUC EP gate config
+    optional LHUCEPGateConfig lhuc_gate = 8;
+    // LHUC PP net config
+    optional LHUCPPNetConfig lhuc_pp_net = 12;
+    // sample weight fusion config
+    optional SampleWeightFusion sample_weight_fusion = 9;
+    // price monotonicity penalty weight, 0 to disable
+    optional float price_monotonicity_weight = 10 [default = 0.0];
+    // price weight field name in sample_weight_fields
+    optional string price_weight_name = 11 [default = "price_weight"];
+}
+
 message DC2VR {
     // shared bottom mlp layer
     optional MLP bottom_mlp = 1;
