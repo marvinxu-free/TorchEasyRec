@@ -320,22 +320,16 @@ class DBMTL_LHUC(MultiTaskRank):
         """Compute loss with sample weight fusion and price monotonicity.
 
         When sample_weight_fusion is configured, per-sample fused weights
-        (date_weight + user_weight) are applied to per-sample losses BEFORE
-        mean reduction, preserving per-sample weighting semantics.
+        (linear combination of N configured weight fields, each normalized
+        by its own mean) are applied to per-sample losses BEFORE mean
+        reduction, preserving per-sample weighting semantics.
         """
         use_fused_weight = self._model_config.HasField("sample_weight_fusion")
 
         if use_fused_weight:
-            # Compute per-sample fused weight
+            # Compute per-sample fused weight from N configured weight fields
             swf = self._model_config.sample_weight_fusion
-            date_w = batch.sample_weights[swf.date_weight_name]
-            user_w = batch.sample_weights[swf.user_weight_name]
-            # Normalize each weight independently before fusion
-            date_w = date_w / (date_w.mean() + 1e-8)
-            user_w = user_w / (user_w.mean() + 1e-8)
-            fused_weight = (
-                swf.date_weight_coeff * date_w + swf.user_weight_coeff * user_w
-            )
+            fused_weight = _compute_fused_weight(swf, batch.sample_weights)
 
             # Compute per-sample losses, apply fused weight, then reduce
             losses = OrderedDict()

@@ -273,6 +273,41 @@ class DBMTL_LHUCTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             _compute_fused_weight(swf, {})
 
+    def test_dbmtl_lhuc_sample_weight_fusion_config(self):
+        """Test model builds with generalized sample_weight_fusion config."""
+        config = self._create_model_config(
+            has_bottom_mlp=True, has_mask_net=False, has_mmoe=True,
+            has_lhuc_gate=False, has_lhuc_pp_net=False,
+        )
+        config.dbmtl_lhuc.sample_weight_fusion.weight_names.extend(
+            ["date_weight", "user_weight", "scence_weight"]
+        )
+        config.dbmtl_lhuc.sample_weight_fusion.weight_coeffs.extend([0.2, 0.8, 1.2])
+
+        features = [
+            RawFeature(
+                feature_name="f1",
+                feature_config=config.feature_configs[0],
+            ),
+            RawFeature(
+                feature_name="f2",
+                feature_config=config.feature_configs[1],
+            ),
+        ]
+        model = DBMTL_LHUC(
+            model_config=config, features=features,
+            labels=["is_click", "is_conversion"],
+        )
+        self.assertTrue(model._model_config.HasField("sample_weight_fusion"))
+        self.assertEqual(
+            list(model._model_config.sample_weight_fusion.weight_names),
+            ["date_weight", "user_weight", "scence_weight"],
+        )
+        self.assertEqual(
+            list(model._model_config.sample_weight_fusion.weight_coeffs),
+            [0.2, 0.8, 1.2],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
