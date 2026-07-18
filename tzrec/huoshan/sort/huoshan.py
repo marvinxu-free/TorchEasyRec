@@ -32,7 +32,7 @@ from absl import flags
 FLAGS = flags.FLAGS
 # import特征
 from features import *
-from lhuc_net import *
+from tzrec.huoshan.sort.lhuc_net import *
 
 
 # 根据行业确定actions的含义的枚举值
