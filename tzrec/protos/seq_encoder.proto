@@ -12,6 +12,11 @@ message DINEncoder {
     required MLP attn_mlp = 3;
     // maximum sequence length
     optional int32 max_seq_length = 6 [default = 0];
+    // whether to use aux features (time-delta) as a scalar gate [B,T,1]
+    // to modulate main sequence features before attention.
+    // recent behaviors (small time delta) -> gate ≈ 1 (full info),
+    // older behaviors (large time delta) -> gate -> 0 (attenuated).
+    optional bool use_time_gate = 7 [default = false];
 }
 
 message SimpleAttention {

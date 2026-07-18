@@ -26,6 +26,7 @@ from tzrec.modules.interaction import CrossV2
 from tzrec.modules.mlp import MLP
 from tzrec.modules.utils import div_no_nan
 from tzrec.protos import model_pb2, simi_pb2, tower_pb2
+from tzrec.protos.models import match_model_pb2
 from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.metric_pb2 import MetricConfig, TrainMetricConfig
 from tzrec.utils.config_util import config_to_kwargs
@@ -75,7 +76,7 @@ class _RocketLaunchingLightTower(nn.Module):
         super().__init__()
         self._group_name = tower_config.input
         self._similarity = rl_config.similarity
-        self._return_hidden = rl_config.feature_based_distillation
+        self._return_hidden = self.training and rl_config.feature_based_distillation
 
         self.embedding_group = EmbeddingGroup(features, feature_groups)
         feature_in = self.embedding_group.group_total_dim(self._group_name)
@@ -117,8 +118,13 @@ class _RocketLaunchingBoosterTower(nn.Module):
 
     Architecture: CrossV2 -> LayerNorm -> Deep MLP -> LayerNorm -> Output
 
+    The booster (teacher) tower reads the same feature group as its
+    corresponding light tower, but uses its own CrossV2 + Deep MLP trunk
+    configured per-side via BoosterTower.
+
     Args:
-        tower_config: tower config (input defines feature group).
+        booster_config: BoosterTower config (cross + deep for this side).
+        group_name: feature group name this tower reads.
         feature_groups: feature group configs for this tower.
         features: list of features.
         rl_config: RocketLaunchingMatch sub-message config.
@@ -126,29 +132,30 @@ class _RocketLaunchingBoosterTower(nn.Module):
 
     def __init__(
         self,
-        tower_config: tower_pb2.Tower,
+        booster_config: match_model_pb2.BoosterTower,
+        group_name: str,
         feature_groups: List[model_pb2.FeatureGroupConfig],
         features: List[BaseFeature],
         rl_config: Any,
     ) -> None:
         super().__init__()
-        self._group_name = tower_config.input
+        self._group_name = group_name
         self._similarity = rl_config.similarity
-        self._return_hidden = rl_config.feature_based_distillation
+        self._return_hidden = self.training and rl_config.feature_based_distillation
 
         self.embedding_group = EmbeddingGroup(features, feature_groups)
         feature_in = self.embedding_group.group_total_dim(self._group_name)
 
         self.cross = CrossV2(
             input_dim=feature_in,
-            **config_to_kwargs(rl_config.cross),
+            **config_to_kwargs(booster_config.cross),
         )
         self.cross_ln = nn.LayerNorm(self.cross.output_dim())
 
         self.deep = MLP(
             in_features=self.cross.output_dim(),
             return_hidden_layer_feature=self._return_hidden,
-            **config_to_kwargs(rl_config.deep),
+            **config_to_kwargs(booster_config.deep),
         )
         self.deep_ln = nn.LayerNorm(self.deep.output_dim())
         self.output_proj = nn.Linear(self.deep.output_dim(), rl_config.output_dim)
@@ -222,15 +229,17 @@ class RocketLaunchingMatch(BaseModel):
             self._in_batch_negative = self._model_config.in_batch_negative
         self.sampler_type = kwargs.get("sampler_type", "negative_sampler")
 
-        # Booster towers (teacher, training only)
+        # Booster towers (teacher, training only) — per-side cross+deep config
         self._booster_user_tower = _RocketLaunchingBoosterTower(
-            self._model_config.user_tower,
+            self._model_config.user_booster,
+            self._model_config.user_tower.input,
             [user_group],
             user_features,
             self._model_config,
         )
         self._booster_item_tower = _RocketLaunchingBoosterTower(
-            self._model_config.item_tower,
+            self._model_config.item_booster,
+            self._model_config.item_tower.input,
             [item_group],
             item_features,
             self._model_config,
@@ -250,12 +259,24 @@ class RocketLaunchingMatch(BaseModel):
             self._model_config,
         )
 
-        self.mlp_index_dict = self._get_distillation_mlp_index()
+        # Per-side width-matched layer index for feature-based distillation.
+        # user/item may differ, so each side gets its own mapping.
+        self.user_mlp_index_dict = self._get_distillation_mlp_index(
+            self._user_tower.mlp.hidden_units,
+            self._booster_user_tower.deep.hidden_units,
+        )
+        self.item_mlp_index_dict = self._get_distillation_mlp_index(
+            self._item_tower.mlp.hidden_units,
+            self._booster_item_tower.deep.hidden_units,
+        )
         self.hint_loss_name = "hint_l2_loss"
 
-    def _get_distillation_mlp_index(self) -> Dict[int, int]:
-        light_hidden_units = self._user_tower.mlp.hidden_units
-        booster_deep_units = self._booster_user_tower.deep.hidden_units
+    def _get_distillation_mlp_index(
+        self,
+        light_hidden_units: List[int],
+        booster_deep_units: List[int],
+    ) -> Dict[int, int]:
+        """Match light MLP layers to booster deep layers by width."""
         mlp_index_dict = {}
         for i, unit_i in enumerate(light_hidden_units):
             for j, unit_j in enumerate(booster_deep_units):
@@ -382,14 +403,14 @@ class RocketLaunchingMatch(BaseModel):
             predictions["item_booster_logits"] = booster_item_result["logits"]
 
             if self._model_config.feature_based_distillation:
-                for i, j in self.mlp_index_dict.items():
+                for i, j in self.user_mlp_index_dict.items():
                     predictions[f"user_light_{i}"] = light_user_result[
                         f"hidden_{i}"
                     ]
                     predictions[f"user_booster_{j}"] = booster_user_result[
                         f"hidden_{j}"
                     ]
-                for i, j in self.mlp_index_dict.items():
+                for i, j in self.item_mlp_index_dict.items():
                     predictions[f"item_light_{i}"] = light_item_result[
                         f"hidden_{i}"
                     ]
@@ -415,13 +436,13 @@ class RocketLaunchingMatch(BaseModel):
         losses[self.hint_loss_name] = user_hint + item_hint
 
         if self._model_config.feature_based_distillation:
-            for i, j in self.mlp_index_dict.items():
+            for i, j in self.user_mlp_index_dict.items():
                 losses[f"user_similarity_{i}_{j}"] = _feature_based_sim(
                     predictions[f"user_light_{i}"],
                     predictions[f"user_booster_{j}"],
                     self._model_config.feature_distillation_function,
                 )
-            for i, j in self.mlp_index_dict.items():
+            for i, j in self.item_mlp_index_dict.items():
                 losses[f"item_similarity_{i}_{j}"] = _feature_based_sim(
                     predictions[f"item_light_{i}"],
                     predictions[f"item_booster_{j}"],

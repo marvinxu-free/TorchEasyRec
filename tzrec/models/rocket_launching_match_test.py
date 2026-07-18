@@ -76,8 +76,14 @@ class RocketLaunchingMatchTest(unittest.TestCase):
                     input="item", mlp=module_pb2.MLP(hidden_units=[16, 8])
                 ),
                 output_dim=4,
-                cross=module_pb2.CrossV2(cross_num=2, low_rank=8),
-                deep=module_pb2.MLP(hidden_units=[16, 8]),
+                user_booster=match_model_pb2.BoosterTower(
+                    cross=module_pb2.CrossV2(cross_num=2, low_rank=8),
+                    deep=module_pb2.MLP(hidden_units=[16, 8]),
+                ),
+                item_booster=match_model_pb2.BoosterTower(
+                    cross=module_pb2.CrossV2(cross_num=2, low_rank=8),
+                    deep=module_pb2.MLP(hidden_units=[16, 8]),
+                ),
                 feature_based_distillation=True,
             ),
             losses=[

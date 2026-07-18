@@ -23,6 +23,9 @@ class LHUCEPGate(nn.Module):
     Faithfully reproduces the original ``lhuc_ep_net`` from lhuc_net.py:
     ``MLP(lhuc_inputs, lhuc_dims + [output_dim]) -> tanh(out * 0.2) * 5.0 + 1.0``.
 
+    ``forward()`` returns only the scale tensor.  The caller applies the
+    multiplication explicitly: ``net = net * self.lhuc_gate(bias_embs)``.
+
     The scale is centered at 1.0 with a range of [-4.0, 6.0], allowing both
     amplification and attenuation of input features.
 
@@ -55,22 +58,23 @@ class LHUCEPGate(nn.Module):
             )
             in_dim = out_dim
 
-    def forward(self, x: torch.Tensor, gate_input: torch.Tensor) -> torch.Tensor:
-        """Scale input features by gate derived from key embeddings.
+    def forward(self, gate_input: torch.Tensor) -> torch.Tensor:
+        """Compute and return the LHUC EP scale factor.
+
+        Reproduces ``lhuc_ep_net``: ``MLP(lhuc_inputs) -> tanh(out*0.2)*5+1``.
+        The caller should apply: ``net = net * lhuc_ep_scale``.
 
         Args:
-            x (torch.Tensor): [batch_size, input_dim] features to scale.
             gate_input (torch.Tensor): [batch_size, gate_input_dim] key embeddings.
 
         Returns:
-            torch.Tensor: [batch_size, input_dim] scaled features.
+            torch.Tensor: [batch_size, input_dim] scale factor.
         """
         gate = self.gate_mlp(gate_input)
-        scale = torch.tanh(gate * 0.2) * 5.0 + 1.0
-        return x * scale
+        return torch.tanh(gate * 0.2) * 5.0 + 1.0
 
     def output_dim(self) -> int:
-        """Output dimension."""
+        """Output dimension (of the scale vector)."""
         return self._input_dim
 
 
@@ -119,7 +123,9 @@ class LHUCPPNet(nn.Module):
     ) -> None:
         super().__init__()
         self._hidden_units = hidden_units
-        self._num_gated = len(hidden_units) - 1 if not scale_last else len(hidden_units)
+        # All layers get tanh gate; scale_last adds an extra sigmoid gate.
+        # Original: for idx in range(len(nn_dims)): each applies tanh scale.
+        self._num_gated = len(hidden_units)
         self._scale_last = scale_last
         self._use_nn_input = use_nn_input
 
@@ -139,7 +145,12 @@ class LHUCPPNet(nn.Module):
         in_dim = input_dim
         for i, out_dim in enumerate(hidden_units):
             self.linears.append(nn.Linear(in_dim, out_dim))
-            self.activations.append(_create_activation(activation))
+            # Original: nn_activations = [act] * (len-1) + [None]
+            # Last layer has no activation.
+            if i < len(hidden_units) - 1:
+                self.activations.append(_create_activation(activation))
+            else:
+                self.activations.append(nn.Identity())
             if dropout_ratio is not None:
                 dr = (
                     dropout_ratio[i]
@@ -151,18 +162,24 @@ class LHUCPPNet(nn.Module):
             self.dropouts.append(nn.Dropout(dr))
             in_dim = out_dim
 
-        # Gate MLPs: one per gated layer, each with
-        # lhuc_hidden_units + [current_layer_dim], last layer no activation
+        # Gate MLPs: one per layer, output dim matches the INPUT dim of that
+        # layer (the dimension being scaled).  Original:
+        #   lhuc_output = MLP(output_dims=lhuc_dims+[int(cur_layer.shape[1])])
+        # where cur_layer.shape[1] is the current layer's input dim.
         self.gate_mlps = nn.ModuleList()
         for i in range(self._num_gated):
-            layer_dim = hidden_units[i]
+            # Gate dim = input dimension of layer i
+            if i == 0:
+                gate_dim = input_dim
+            else:
+                gate_dim = hidden_units[i - 1]
             gate_mlp = nn.Sequential()
-            in_dim = effective_gate_dim
-            all_gate_dims = lhuc_hidden_units + [layer_dim]
+            g_in_dim = effective_gate_dim
+            all_gate_dims = lhuc_hidden_units + [gate_dim]
             for j, gd in enumerate(all_gate_dims):
                 act = gate_activation if j < len(all_gate_dims) - 1 else None
-                gate_mlp.append(Perceptron(in_dim, gd, activation=act))
-                in_dim = gd
+                gate_mlp.append(Perceptron(g_in_dim, gd, activation=act))
+                g_in_dim = gd
             self.gate_mlps.append(gate_mlp)
 
         # scale_last gate: intermediate layers relu, last layer sigmoid
@@ -170,18 +187,21 @@ class LHUCPPNet(nn.Module):
         if scale_last:
             last_dim = hidden_units[-1]
             self.scale_last_gate = nn.Sequential()
-            in_dim = effective_gate_dim
+            g_in_dim = effective_gate_dim
             all_gate_dims = lhuc_hidden_units + [last_dim]
             for j, gd in enumerate(all_gate_dims):
                 if j < len(all_gate_dims) - 1:
                     act = gate_activation
                 else:
                     act = "nn.Sigmoid"
-                self.scale_last_gate.append(Perceptron(in_dim, gd, activation=act))
-                in_dim = gd
+                self.scale_last_gate.append(Perceptron(g_in_dim, gd, activation=act))
+                g_in_dim = gd
 
     def forward(self, x: torch.Tensor, gate_input: torch.Tensor) -> torch.Tensor:
         """Forward with per-layer gating.
+
+        Each layer applies: ``scale = tanh(MLP(gate_input) * 0.2) * (5+i) + 1``,
+        then ``x = Linear(x * scale)`` — matching the original ``cur_layer * lhuc_scale -> MLP``.
 
         Args:
             x (torch.Tensor): [batch_size, input_dim] input features.
@@ -198,12 +218,13 @@ class LHUCPPNet(nn.Module):
             )
 
         for i in range(len(self._hidden_units)):
-            x = self.linears[i](x)
-            x = self.activations[i](x)
+            # Scale input BEFORE linear (original: cur_layer * lhuc_scale -> MLP)
             if i < self._num_gated:
                 gate_out = self.gate_mlps[i](eff_gate)
                 scale = torch.tanh(gate_out * 0.2) * (5.0 + i) + 1.0
                 x = x * scale
+            x = self.linears[i](x)
+            x = self.activations[i](x)
             x = self.dropouts[i](x)
 
         if self._scale_last:

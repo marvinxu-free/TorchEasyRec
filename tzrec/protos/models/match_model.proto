@@ -83,19 +83,32 @@ message MIND {
 }
 
 
+message BoosterTower {
+    // Booster(teacher) tower 主干：CrossV2 -> Deep MLP 串行。
+    // 读取与其对应 light tower 相同的 feature group。
+    required CrossV2 cross = 1;
+    required MLP deep = 2;
+}
+
 message RocketLaunchingMatch {
-    // Light tower 配置（推理时使用）
+    // ===== Light towers（student，训练+推理） =====
+    // input = feature group 名；mlp = light 学生 MLP。
     required Tower user_tower = 1;
     required Tower item_tower = 2;
+
+    // ===== Shared（light/booster、user/item 共用） =====
     // user and item tower output embedding dimension
     required int32 output_dim = 3;
     optional Similarity similarity = 4 [default=INNER_PRODUCT];
     optional float temperature = 5 [default = 1.0];
     optional bool in_batch_negative = 6 [default = false];
 
-    // Booster tower 配置（训练时使用，每个 tower 独立实例化）
-    required CrossV2 cross = 10;
-    required MLP deep = 11;
-    optional bool feature_based_distillation = 12 [default = false];
-    optional Similarity feature_distillation_function = 13 [default=COSINE];
+    // ===== Booster towers（teacher，仅训练；按侧独立配置） =====
+    required BoosterTower user_booster = 10;
+    required BoosterTower item_booster = 11;
+
+    // ===== Distillation =====
+    optional bool feature_based_distillation = 20 [default = false];
+    // COSINE = 0; EUCLID = 1;
+    optional Similarity feature_distillation_function = 21 [default=COSINE];
 }

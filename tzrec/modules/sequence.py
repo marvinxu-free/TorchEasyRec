@@ -71,12 +71,28 @@ class DINEncoder(SequenceEncoder):
     ``queries * sequence``) only apply to the aligned prefix.  The final
     weighted-sum still uses the **full** sequence, preserving all features.
 
+    When ``use_time_gate=True`` and aux_dim > 0, the aux embeddings
+    (typically time-delta features along the sequence axis) are used to
+    generate a per-position scalar gate ``[B, T, 1]`` that modulates the
+    main sequence features before attention.  Since aux embeddings
+    correspond to increasing time deltas along T, the gate learns to
+    attenuate older behaviors: ``gate = sigmoid(linear(aux))``, where
+    recent positions (small time delta) → gate ≈ 1, and distant positions
+    (large time delta) → gate → 0.
+
     Args:
         sequence_dim (int): sequence tensor channel dimension.
         query_dim (int): query tensor channel dimension.
         input(str): input feature group name.
         attn_mlp (dict): target attention MLP module parameters.
         max_seq_length (int): maximum sequence length.
+        use_time_gate (bool): whether to use aux features (time-delta) as a
+            scalar gating signal to modulate main sequence features before
+            attention.  When enabled, ``sigmoid(linear(sequence_aux))``
+            produces a ``[B, T, 1]`` gate applied as
+            ``sequence_main = sequence_main * gate``, so the model learns
+            a time-dependent forgetting curve along the sequence axis.
+            Default: False.
     """
 
     def __init__(
@@ -86,6 +102,7 @@ class DINEncoder(SequenceEncoder):
         input: str,
         attn_mlp: Dict[str, Any],
         max_seq_length: int = 0,
+        use_time_gate: bool = False,
         **kwargs: Optional[Dict[str, Any]],
     ) -> None:
         super().__init__(input)
@@ -94,6 +111,14 @@ class DINEncoder(SequenceEncoder):
         if self._query_dim > self._sequence_dim:
             raise ValueError("query_dim > sequence_dim not supported yet.")
         self._aux_dim = max(0, self._sequence_dim - self._query_dim)
+        self._use_time_gate = use_time_gate and self._aux_dim > 0
+
+        # Time gate: maps aux embeddings (time-delta) to a scalar gate [B,T,1].
+        # sequence_aux 沿 T 维度是递增的时间差 embedding,
+        # gate 学习一个衰减曲线: 近期行为 gate≈1, 远期行为 gate→0.
+        if self._use_time_gate:
+            self.time_gate_linear = nn.Linear(self._aux_dim, 1)
+
         attn_input_dim = self._query_dim * 4 + self._aux_dim
         self.mlp = MLP(in_features=attn_input_dim, dim=3, **attn_mlp)
         self.linear = nn.Linear(self.mlp.hidden_units[-1], 1)
@@ -107,7 +132,18 @@ class DINEncoder(SequenceEncoder):
         return self._sequence_dim
 
     def forward(self, sequence_embedded: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Forward the module."""
+        """Forward the module.
+
+        When ``use_time_gate=True``, the forward pass applies:
+        1. Split sequence into main (content) and aux (time-delta) parts.
+        2. Compute scalar time gate: ``gate = sigmoid(linear(aux))`` → [B,T,1].
+        3. Modulate: ``sequence_main_gated = sequence_main * gate``.
+        4. Use ``sequence_main_gated`` in attention computation (element-wise
+           ops with query), so older behaviors contribute less to attention
+           scores.
+        5. Weighted-sum still uses full ``sequence`` (not gated), preserving
+           all information in the output representation.
+        """
         query = sequence_embedded[self._query_name]
         sequence = sequence_embedded[self._sequence_name]
         sequence_length = sequence_embedded[self._sequence_length_name]
@@ -124,12 +160,25 @@ class DINEncoder(SequenceEncoder):
         if self._aux_dim > 0:
             sequence_main = sequence[:, :, : self._query_dim]
             sequence_aux = sequence[:, :, self._query_dim :]
+
+            # Time-gated fusion: aux 沿 T 是递增时间差 embedding,
+            # 生成标量 gate [B,T,1] 调制 content features.
+            # 近期行为(小时间差) → gate≈1 → 保留完整信息,
+            # 远期行为(大时间差) → gate→0 → 衰减特征表示.
+            if self._use_time_gate:
+                time_gate = torch.sigmoid(
+                    self.time_gate_linear(sequence_aux)
+                )  # [B, T, 1]
+                sequence_main_gated = sequence_main * time_gate
+            else:
+                sequence_main_gated = sequence_main
+
             attn_input = torch.cat(
                 [
                     queries,
-                    sequence_main,
-                    queries - sequence_main,
-                    queries * sequence_main,
+                    sequence_main_gated,
+                    queries - sequence_main_gated,
+                    queries * sequence_main_gated,
                     sequence_aux,
                 ],
                 dim=-1,

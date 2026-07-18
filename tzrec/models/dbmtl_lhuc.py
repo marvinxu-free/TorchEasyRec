@@ -334,19 +334,22 @@ class DBMTL_LHUC(MultiTaskRank):
                 task_net[tower_name] = task_input_list[i]
 
         # Bias auxiliary task predictions (branch from target_tower's
-        # representation). Does NOT modify tower logits — auxiliary
-        # regression/classification only.
+        # representation). Train-only: bias heads supervise bias fields as
+        # auxiliary signals (see _compute_bias_losses) and are not consumed at
+        # inference, so skip them at eval to avoid the per-request MLP+Linear
+        # cost and the extra output keys. Does NOT modify tower logits.
         bias_predictions: Dict[str, torch.Tensor] = {}
-        for bias_cfg in self._bias_task_cfgs:
-            name = bias_cfg.name
-            rep = task_net[bias_cfg.target_tower]
-            h = self.bias_mlps[name](rep) if name in self.bias_mlps else rep
-            pred = self.bias_outputs[name](h).squeeze(-1)  # [B]
-            loss_type = bias_cfg.loss.WhichOneof("loss")
-            if loss_type == "l2_loss":
-                bias_predictions[f"y_bias_{name}"] = pred
-            else:  # binary_cross_entropy / softmax_cross_entropy / ... use logits
-                bias_predictions[f"logits_bias_{name}"] = pred
+        if self.training:
+            for bias_cfg in self._bias_task_cfgs:
+                name = bias_cfg.name
+                rep = task_net[bias_cfg.target_tower]
+                h = self.bias_mlps[name](rep) if name in self.bias_mlps else rep
+                pred = self.bias_outputs[name](h).squeeze(-1)  # [B]
+                loss_type = bias_cfg.loss.WhichOneof("loss")
+                if loss_type == "l2_loss":
+                    bias_predictions[f"y_bias_{name}"] = pred
+                else:  # binary_cross_entropy / softmax_cross_entropy / ... use logits
+                    bias_predictions[f"logits_bias_{name}"] = pred
 
         relation_net = {}
         for task_tower_cfg in self._task_tower_cfgs:
@@ -439,5 +442,8 @@ class DBMTL_LHUC(MultiTaskRank):
                 suffix=f"_bias_{name}",
             )
             for k, v in bl.items():
-                bias_losses[k] = v * bias_cfg.weight
+                # _loss_impl returns per-sample losses (reduction="none"); reduce
+                # to mean so bias loss magnitude is comparable to main-task loss
+                # (which is also mean-reduced) and not ~batch_size times larger.
+                bias_losses[k] = torch.mean(v) * bias_cfg.weight
         return bias_losses

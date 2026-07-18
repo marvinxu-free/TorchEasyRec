@@ -3,6 +3,8 @@ package tzrec.protos;
 
 import "tzrec/protos/module.proto";
 import "tzrec/protos/simi.proto";
+import "tzrec/protos/tower.proto";
+import "tzrec/protos/models/multi_task_rank.proto";
 
 
 message RocketLaunching {
@@ -25,4 +27,55 @@ message RocketLaunching2 {
     optional bool feature_based_distillation = 5 [default = false];
     // COSINE = 0; EUCLID = 1;
     optional Similarity feature_distillation_function = 6 [default = COSINE];
+}
+
+message LHUCRocketLaunching {
+    optional MLP share_mlp = 1;
+    // Booster: DCNv2 parallel bottom + LHUC + Task MLP
+    optional MLP bottom_mlp = 2;
+    required CrossV2 dcnv2 = 3;
+    optional LHUCEPGateConfig lhuc_gate = 4;
+    required MLP booster_mlp = 5;
+    // Light: simple MLP (student)
+    required MLP light_mlp = 6;
+    // Distillation config
+    optional bool feature_based_distillation = 7 [default = false];
+    // COSINE = 0; EUCLID = 1;
+    optional Similarity feature_distillation_function = 8 [default = COSINE];
+    // LHUC PP net config (requires lhuc_gate for bias features)
+    optional LHUCPPNetConfig lhuc_pp_net = 9;
+}
+
+message LHUCRocketLaunchingMT {
+    // ===== Booster (teacher, training only) =====
+    // Booster mirrors DBMTL_LHUC: DCNv2 parallel bottom + LHUC + MMoE +
+    // task towers (with Bayes relation nets) + optional bias heads.
+    optional MaskNetModule mask_net = 1;
+    optional MLP bottom_mlp = 2;
+    required CrossV2 dcnv2 = 3;
+    optional MLP expert_mlp = 4;
+    optional MLP gate_mlp = 5;
+    optional uint32 num_expert = 6 [default = 3];
+    optional LHUCEPGateConfig lhuc_gate = 7;
+    optional LHUCPPNetConfig lhuc_pp_net = 8;
+    // task_towers define the shared multi-task structure for BOTH booster
+    // and light (tower_name / label_name / losses / num_class / weight).
+    repeated BayesTaskTower task_towers = 9;
+    optional SampleWeightFusion sample_weight_fusion = 10;
+    // bias auxiliary task heads (booster only)
+    repeated BiasTask bias_tasks = 11;
+
+    // ===== Light (student, training + inference) =====
+    optional MLP share_mlp = 20;
+    required MLP light_mlp = 21;
+    // optional per-tower light head MLP; when set, its hidden_units may align
+    // with each task_tower.mlp for feature-based distillation.
+    optional MLP light_task_mlp = 22;
+
+    // ===== Distillation =====
+    optional bool feature_based_distillation = 30 [default = false];
+    // COSINE = 0; EUCLID = 1;
+    optional Similarity feature_distillation_function = 31 [default = COSINE];
+    // weight applied to per-tower logit hint (MSE) loss
+    optional float hint_loss_weight = 32 [default = 1.0];
 }
