@@ -87,12 +87,15 @@ message ModelConfig {
 
         RocketLaunching rocket_launching = 500;
         RocketLaunching2 rocket_launching2 = 501;
+        LHUCRocketLaunching lhuc_rocket_launching = 502;
+        LHUCRocketLaunchingMT lhuc_rocket_launching_mt = 503;
 
         // SID generation models
         // (600 is reserved for SidRqvae, arriving in the follow-up PR)
         SidRqkmeans sid_rqkmeans = 601;
 
         DBMTL_DCNv2 dbmtl_dcnv2 = 208;
+        DBMTL_LHUC dbmtl_lhuc = 209;
     }
 
     optional uint32 num_class = 2 [default = 1];
@@ -112,5 +115,9 @@ message ModelConfig {
 
     // uncertainty weighting for multi-task loss
     optional UncertaintyWeighting uncertainty_weighting = 14;
+
+    // drop a whole feature family jointly per-sample during training (e.g. to
+    // simulate real-time features going absent at serving).
+    optional FeatureFamilyDropout feature_family_dropout = 16;
 
 }

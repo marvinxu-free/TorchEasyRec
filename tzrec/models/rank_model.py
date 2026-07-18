@@ -19,6 +19,9 @@ from torch import nn
 from tzrec.constant import TARGET_REPEAT_INTERLEAVE_KEY
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
+from tzrec.loss.bce_with_correction import (
+    BinaryCrossEntropyWithCorrectionLoss,
+)
 from tzrec.loss.focal_loss import BinaryFocalLoss
 from tzrec.loss.jrc_loss import JRCLoss
 from tzrec.metrics.decay_auc import DecayAUC
@@ -29,6 +32,7 @@ from tzrec.metrics.train_metric_wrapper import TrainMetricWrapper
 from tzrec.metrics.xauc import XAUC
 from tzrec.models.model import BaseModel
 from tzrec.modules.embedding import EmbeddingGroup
+from tzrec.modules.feature_family_dropout import build_feature_family_dropouts
 from tzrec.modules.utils import div_no_nan
 from tzrec.modules.variational_dropout import VariationalDropout
 from tzrec.protos import model_pb2
@@ -52,6 +56,16 @@ def _is_classification_loss(loss_cfg: LossConfig) -> bool:
         "jrc_loss",
         "binary_focal_loss",
     ]
+
+
+def _signed_log1p(x: torch.Tensor) -> torch.Tensor:
+    """Sign-preserving log1p: monotonic, maps R -> R, compresses magnitude.
+
+    Used by ``L2Loss(SIGNED_LOG1P)`` to make the squared error scale-invariant
+    (a relative-error-like loss) so wide-range regression targets (e.g. price
+    bias) become comparable in magnitude to BCE without offline normalization.
+    """
+    return x.sign() * torch.log1p(x.abs())
 
 
 class RankModel(BaseModel):
@@ -79,6 +93,7 @@ class RankModel(BaseModel):
         self._loss_collection = OrderedDict()
         self.embedding_group = None
         self.group_variational_dropouts = None
+        self.group_feature_family_dropouts = None
 
     def init_input(self) -> None:
         """Build embedding group and group variational dropout."""
@@ -111,6 +126,17 @@ class RankModel(BaseModel):
                             variational_dropout
                         )
 
+        if self._base_model_config.HasField("feature_family_dropout"):
+            self.group_feature_family_dropouts = nn.ModuleDict(
+                build_feature_family_dropouts(
+                    self._feature_groups,
+                    self.embedding_group,
+                    self._base_model_config.feature_family_dropout,
+                )
+            )
+            if len(self.group_feature_family_dropouts) == 0:
+                self.group_feature_family_dropouts = None
+
     def build_input(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Build input feature."""
         feature_dict = self.embedding_group(batch)
@@ -128,6 +154,16 @@ class RankModel(BaseModel):
                     variational_dropout_loss,
                     group_name + "_feature_p_loss",
                 )
+        if self.group_feature_family_dropouts is not None:
+            for (
+                group_name,
+                feature_family_dropout,
+            ) in self.group_feature_family_dropouts.items():
+                _update_tensor_dict(
+                    feature_dict,
+                    feature_family_dropout(feature_dict[group_name]),
+                    group_name,
+                )
         return feature_dict
 
     def _output_to_prediction_impl(
@@ -139,7 +175,11 @@ class RankModel(BaseModel):
     ) -> Dict[str, torch.Tensor]:
         predictions = {}
         loss_type = loss_cfg.WhichOneof("loss")
-        if loss_type in ("binary_cross_entropy", "binary_focal_loss"):
+        if loss_type in (
+            "binary_cross_entropy",
+            "binary_focal_loss",
+            "binary_cross_entropy_with_correction",
+        ):
             assert num_class == 1, f"num_class must be 1 when loss type is {loss_type}"
             output = torch.squeeze(output, dim=1)
             predictions["logits" + suffix] = output
@@ -195,6 +235,14 @@ class RankModel(BaseModel):
                 alpha=loss_cfg.binary_focal_loss.alpha,
                 reduction=reduction,
             )
+        elif loss_type == "binary_cross_entropy_with_correction":
+            self._loss_modules[loss_name] = BinaryCrossEntropyWithCorrectionLoss(
+                sample_bias=loss_cfg.binary_cross_entropy_with_correction.sample_bias,
+                logit_clip_threshold=(
+                    loss_cfg.binary_cross_entropy_with_correction.logit_clip_threshold
+                ),
+                reduction=reduction,
+            )
         elif loss_type == "softmax_cross_entropy":
             self._loss_modules[loss_name] = nn.CrossEntropyLoss(
                 reduction=reduction,
@@ -206,7 +254,12 @@ class RankModel(BaseModel):
                 alpha=loss_cfg.jrc_loss.alpha, reduction=reduction
             )
         elif loss_type == "l2_loss":
-            self._loss_modules[loss_name] = nn.MSELoss(reduction=reduction)
+            if loss_cfg.l2_loss.huber_delta > 0:
+                self._loss_modules[loss_name] = nn.HuberLoss(
+                    delta=loss_cfg.l2_loss.huber_delta, reduction=reduction
+                )
+            else:
+                self._loss_modules[loss_name] = nn.MSELoss(reduction=reduction)
         else:
             raise ValueError(f"loss[{loss_type}] is not supported yet.")
 
@@ -230,14 +283,42 @@ class RankModel(BaseModel):
 
         loss_type = loss_cfg.WhichOneof("loss")
         loss_name = loss_type + suffix
-        if loss_type in ("binary_cross_entropy", "binary_focal_loss"):
+        if loss_type in (
+            "binary_cross_entropy",
+            "binary_focal_loss",
+            "binary_cross_entropy_with_correction",
+        ):
             pred = predictions["logits" + suffix]
             label = label.to(torch.float32)
             if loss_type == "binary_cross_entropy":
                 label_smoothing = loss_cfg.binary_cross_entropy.label_smoothing
                 if label_smoothing > 0:
                     label = label * (1.0 - label_smoothing) + 0.5 * label_smoothing
-            losses[loss_name] = self._loss_modules[loss_name](pred, label)
+                losses[loss_name] = self._loss_modules[loss_name](pred, label)
+            elif loss_type == "binary_focal_loss":
+                losses[loss_name] = self._loss_modules[loss_name](pred, label)
+            else:  # binary_cross_entropy_with_correction
+                corr_cfg = loss_cfg.binary_cross_entropy_with_correction
+                label_smoothing = corr_cfg.label_smoothing
+                if label_smoothing > 0:
+                    label = label * (1.0 - label_smoothing) + 0.5 * label_smoothing
+                # sample_rate and sample_bias are independent (mirrors huoshan
+                # LogitCorrection.get_sample_logits). sample_rate is None when
+                # no per-sample column is available and the constant fallback
+                # is the default 1.0 (i.e. no sampling correction desired).
+                sample_rate = None
+                if (
+                    corr_cfg.HasField("sample_rate_field")
+                    and corr_cfg.sample_rate_field in batch.sample_weights
+                ):
+                    sample_rate = batch.sample_weights[
+                        corr_cfg.sample_rate_field
+                    ].reshape(-1)
+                elif corr_cfg.sample_rate != 1.0:
+                    sample_rate = torch.full_like(pred, corr_cfg.sample_rate)
+                losses[loss_name] = self._loss_modules[loss_name](
+                    pred, label, sample_rate
+                )
         elif loss_type == "softmax_cross_entropy":
             pred = predictions["logits" + suffix]
             losses[loss_name] = self._loss_modules[loss_name](pred, label)
@@ -254,6 +335,9 @@ class RankModel(BaseModel):
             losses[loss_name] = self._loss_modules[loss_name](pred, label, session_id)
         elif loss_type == "l2_loss":
             pred = predictions["y" + suffix]
+            if loss_cfg.l2_loss.transform == loss_cfg.l2_loss.SIGNED_LOG1P:
+                pred = _signed_log1p(pred)
+                label = _signed_log1p(label)
             losses[loss_name] = self._loss_modules[loss_name](pred, label)
         else:
             raise ValueError(f"loss[{loss_type}] is not supported yet.")

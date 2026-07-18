@@ -36,6 +36,23 @@ message  VariationalDropout {
 }
 
 
+message FeatureFamilyDropout {
+    // probability of dropping the whole feature family for a sample during
+    // training. Models the serving condition where an entire feature family
+    // (e.g. real-time behavior features) is jointly absent for a user, so the
+    // model learns to fall back to long-term signals instead of collapsing.
+    // 0.0 disables. Active only in train mode; no-op at eval/export.
+    optional float dropout_prob = 1 [default = 0.0];
+    // explicit feature names that belong to the family; matched exactly
+    // (case-sensitive) against feature names within the group. All listed
+    // features are dropped together per sample. Every name must exist in the
+    // target group's feature list.
+    repeated string feature_names = 2;
+    // group to apply on; empty/omitted = every non-sequence group.
+    optional string group_name = 3;
+}
+
+
 message B2ICapsule {
     // max number of high capsules Default: 5
     optional uint32 max_k = 1 [default = 5];

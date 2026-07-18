@@ -8,6 +8,7 @@ message LossConfig {
         L2Loss l2_loss = 3;
         JRCLoss jrc_loss = 4;
         BinaryFocalLoss binary_focal_loss = 5;
+        BinaryCrossEntropyWithCorrection binary_cross_entropy_with_correction = 6;
     }
 }
 
@@ -20,6 +21,19 @@ message SoftmaxCrossEntropy {
 }
 
 message L2Loss {
+    // Target/output transform applied before computing the squared error.
+    // SIGNED_LOG1P maps both pred and target through sign(x)*log1p(|x|),
+    // yielding a relative-error-like loss that is scale-invariant and thus
+    // comparable in magnitude to BCE -- used when the regression target spans
+    // a wide range (e.g. price bias) and cannot be normalized offline.
+    enum Transform {
+        NONE = 0;
+        SIGNED_LOG1P = 1;
+    }
+    optional Transform transform = 1 [default = NONE];
+    // If > 0, switch from squared error to Huber loss with this delta in the
+    // (possibly transformed) space; robust to heavy-tailed targets.
+    optional float huber_delta = 2 [default = 0.0];
 }
 
 message JRCLoss {
@@ -30,6 +44,19 @@ message JRCLoss {
 message BinaryFocalLoss {
     optional float gamma = 1 [default = 2.0];
     optional float alpha = 2 [default = 0.5];
+}
+
+message BinaryCrossEntropyWithCorrection {
+    // 每样本负采样率字段名, 需同时在 data_config.sample_weight_fields 中声明该列.
+    // 不设置时退化为常量 sample_rate (默认 1.0, 即不纠偏).
+    optional string sample_rate_field = 1;
+    // 是否启用 fast_emit 纠偏 (safe_log_sigmoid 分支).
+    optional bool sample_bias = 2 [default = false];
+    optional float label_smoothing = 3 [default = 0.0];
+    // logit 截断阈值, 取值 (0,1); 0 表示关闭.
+    optional float logit_clip_threshold = 4 [default = 0.0];
+    // 常量负采样率, 仅在 sample_rate_field 未设置或 batch 中缺失时使用.
+    optional float sample_rate = 5 [default = 1.0];
 }
 
 message UncertaintyWeighting {

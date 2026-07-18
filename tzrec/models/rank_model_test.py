@@ -331,5 +331,97 @@ class RankModelTest(unittest.TestCase):
             )
 
 
+class SignedLog1pTest(unittest.TestCase):
+    """Pure-function tests for the signed-log1p transform."""
+
+    def test_zero_maps_to_zero(self) -> None:
+        from tzrec.models.rank_model import _signed_log1p
+
+        self.assertTrue(
+            torch.allclose(_signed_log1p(torch.zeros(4)), torch.zeros(4))
+        )
+
+    def test_sign_preserving_and_matches_formula(self) -> None:
+        from tzrec.models.rank_model import _signed_log1p
+
+        x = torch.tensor([-3.0, -0.5, 0.0, 0.7, 5.0, 50.0])
+        z = _signed_log1p(x)
+        expected = x.sign() * torch.log1p(x.abs())
+        torch.testing.assert_close(z, expected)
+        self.assertTrue(torch.all(z.sign() == x.sign()))
+
+    def test_monotonic_increasing(self) -> None:
+        from tzrec.models.rank_model import _signed_log1p
+
+        x = torch.linspace(-50.0, 50.0, 401)
+        z = _signed_log1p(x)
+        self.assertTrue(torch.all(z[1:] >= z[:-1]))
+
+
+class L2TransformRegressionTest(unittest.TestCase):
+    """End-to-end: L2Loss transform / huber_delta reach the loss value.
+
+    Reuses _TestRegressionModel, whose prediction equals the dense feature
+    ([0.2, 0.3]) against label [0.0, 1.0].
+    """
+
+    def _run(self, l2_cfg: loss_pb2.L2Loss) -> Dict[str, torch.Tensor]:
+        model_config = model_pb2.ModelConfig(
+            losses=[loss_pb2.LossConfig(l2_loss=l2_cfg)]
+        )
+        model = _TestRegressionModel(
+            model_config=model_config, features=[], labels=["label"]
+        )
+        model = TrainWrapper(model)
+        model = create_test_model(model, TestGraphType.NORMAL)
+        sparse_feature = KeyedJaggedTensor.from_lengths_sync(
+            keys=["id_a"], values=torch.tensor([1, 1]), lengths=torch.tensor([1, 1])
+        )
+        dense_feature = KeyedTensor.from_tensor_list(
+            keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
+        )
+        batch = Batch(
+            dense_features={BASE_DATA_GROUP: dense_feature},
+            sparse_features={BASE_DATA_GROUP: sparse_feature},
+            labels={"label": torch.tensor([0.0, 1.0])},
+        )
+        _, (losses, _, _) = model(batch)
+        return losses
+
+    def test_signed_log_transform_loss(self) -> None:
+        l2 = loss_pb2.L2Loss(transform=loss_pb2.L2Loss.SIGNED_LOG1P)
+        losses = self._run(l2)
+        pred = torch.tensor([0.2, 0.3])
+        label = torch.tensor([0.0, 1.0])
+        z_pred = pred.sign() * torch.log1p(pred.abs())
+        z_label = label.sign() * torch.log1p(label.abs())
+        expected = torch.mean((z_pred - z_label) ** 2)
+        torch.testing.assert_close(losses["l2_loss"], expected, rtol=1e-4, atol=1e-4)
+
+    def test_huber_l2_loss(self) -> None:
+        import torch.nn.functional as F
+
+        l2 = loss_pb2.L2Loss(huber_delta=1.0)
+        losses = self._run(l2)
+        pred = torch.tensor([0.2, 0.3])
+        label = torch.tensor([0.0, 1.0])
+        expected = F.huber_loss(pred, label, reduction="mean", delta=1.0)
+        torch.testing.assert_close(losses["l2_loss"], expected, rtol=1e-4, atol=1e-4)
+
+    def test_signed_log_transform_with_huber(self) -> None:
+        import torch.nn.functional as F
+
+        l2 = loss_pb2.L2Loss(
+            transform=loss_pb2.L2Loss.SIGNED_LOG1P, huber_delta=1.0
+        )
+        losses = self._run(l2)
+        pred = torch.tensor([0.2, 0.3])
+        label = torch.tensor([0.0, 1.0])
+        z_pred = pred.sign() * torch.log1p(pred.abs())
+        z_label = label.sign() * torch.log1p(label.abs())
+        expected = F.huber_loss(z_pred, z_label, reduction="mean", delta=1.0)
+        torch.testing.assert_close(losses["l2_loss"], expected, rtol=1e-4, atol=1e-4)
+
+
 if __name__ == "__main__":
     unittest.main()
