@@ -246,6 +246,23 @@ TRAIN_OUT_TYPE = Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Batch]
 TRAIN_FWD_TYPE = Tuple[torch.Tensor, TRAIN_OUT_TYPE]
 
 
+def _is_pcgrad_aux_loss(loss_key: str) -> bool:
+    """Classify a loss dict key as an *auxiliary* (non-main-task) loss.
+
+    Auxiliary losses are summed into the PCGrad backward but excluded from
+    per-task gradient projection: they are regularizers / auxiliary heads,
+    not competing objectives, so projecting main tasks against them would
+    spuriously trim the main gradients (PCGrad is symmetric).
+
+    Recognized auxiliary keys:
+      - bias auxiliary heads: ``..._bias_<name>``
+      - variational dropout regularizers: ``<group>_feature_p_loss``
+
+    Any other key is a main task tower loss (``<loss_type>_<tower_name>``).
+    """
+    return "_bias_" in loss_key or loss_key.endswith("_p_loss")
+
+
 class TrainWrapper(BaseModule):
     """Model train wrapper for pipeline."""
 
@@ -272,6 +289,10 @@ class TrainWrapper(BaseModule):
             self.pareto = ParetoEfficientMultiTaskLoss(
                 self.model._pareto_init_weight_cs
             )
+        # PCGrad: when the underlying model opts in, forward() returns a 1-D
+        # per-task loss tensor (in insertion order of model.loss()) instead of
+        # a summed scalar, so TrainPipelinePCGrad can extract per-task grads.
+        self._use_pcgrad = bool(getattr(self.model, "_use_pcgrad", False))
 
     def forward(self, batch: Batch) -> TRAIN_FWD_TYPE:
         """Predict and compute loss.
@@ -294,6 +315,32 @@ class TrainWrapper(BaseModule):
             losses = self.model.loss(predictions, batch)
             if self.training and self.pareto:
                 total_loss = self.pareto(losses, self.model)
+            elif self.training and self._use_pcgrad:
+                # Split losses into main task losses (PCGrad-projected, one
+                # gradient per tower) and auxiliary losses (bias auxiliary
+                # heads + dropout regularizers). Aux losses are NOT projected
+                # — they are regularizers, not competing objectives, so
+                # projecting main tasks against them would symmetrically trim
+                # the main gradients. They are appended as a single summed
+                # element so that:
+                #   - the real-graph backward (torch.sum) still includes them
+                #     (sparse params / DDP sync get their gradient), and
+                #   - _pcgrad_backward treats indices [:-1] as main tasks to
+                #     project, and the last element as aux whose dense grad is
+                #     added to the projected target WITHOUT projection.
+                # See _is_pcgrad_aux_loss for the key-naming contract.
+                main_losses = [
+                    v for k, v in losses.items() if not _is_pcgrad_aux_loss(k)
+                ]
+                aux_losses = [v for k, v in losses.items() if _is_pcgrad_aux_loss(k)]
+                main_stack = torch.stack(main_losses)
+                if aux_losses:
+                    aux_sum = torch.stack(aux_losses).sum()
+                else:
+                    aux_sum = torch.zeros(
+                        (), dtype=main_stack.dtype, device=main_stack.device
+                    )
+                total_loss = torch.cat([main_stack, aux_sum.reshape(1)])
             elif "total_loss" in losses:
                 total_loss = losses["total_loss"]
             else:
@@ -364,9 +411,9 @@ class ScriptWrapper(BaseModule):
         self.model = module
         self._data_parser = DataParser(
             self.model.features,
-            sampler_type=str(module.sampler_type)
-            if hasattr(module, "sampler_type")
-            else None,
+            sampler_type=(
+                str(module.sampler_type) if hasattr(module, "sampler_type") else None
+            ),
         )
 
     @property

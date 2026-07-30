@@ -46,6 +46,52 @@ message LHUCRocketLaunching {
     optional LHUCPPNetConfig lhuc_pp_net = 9;
 }
 
+// AGE (Adversarial Gradient Driven Exploration) exploration config.
+// Reference: KDD 2022 - "Adversarial Gradient Driven Exploration for Deep Click-Through Rate Prediction"
+message AGEExplorationConfig {
+    // Whether to enable AGE exploration at inference time
+    optional bool enable = 1 [default = false];
+
+    // Uncertainty estimation method: UCB (standard deviation) or TS (Thompson Sampling)
+    // UCB: uses std of multiple dropout outputs
+    // TS: uses single dropout output minus mean
+    optional string uncertainty_method = 2 [default = "TS"];
+
+    // Dropout rate for MC Dropout (default 0.01 as per paper)
+    optional float dropout_rate = 3 [default = 0.01];
+
+    // Number of dropout samples for UCB (default 20 as per paper)
+    optional uint32 num_dropout_samples = 4 [default = 20];
+
+    // Adversarial gradient method: FGM (single step) or PGD (multi-step)
+    // PGD is recommended (2.9% better in paper experiments)
+    optional bool use_pgd = 5 [default = true];
+
+    // Number of PGD steps (default 5 as per paper)
+    optional uint32 pgd_steps = 6 [default = 5];
+
+    // Perturbation epsilon (step size):
+    // - Offline: 1e-3 (as per paper)
+    // - Online: 2e-3 (as per paper)
+    optional float epsilon = 7 [default = 0.002];
+
+    // Feature group name for DGU (Dynamic Gating Unit) item-only network
+    // The group must be defined in feature_groups at model config level
+    // This is the recommended way - cleaner than listing individual feature names
+    optional string item_feature_group = 9;
+
+    // Feature names used for DGU item-only network (legacy way)
+    // Only used when item_feature_group is not set
+    repeated string item_feature_names = 8;
+
+    // Whether to use soft gating (0~1) instead of hard binary gating (0/1)
+    optional bool soft_gate = 10 [default = false];
+
+    // Task tower name to apply exploration (e.g., "is_click")
+    // If empty, applies to all tasks
+    optional string explore_task = 11;
+}
+
 message LHUCRocketLaunchingMT {
     // ===== Booster (teacher, training only) =====
     // Booster mirrors DBMTL_LHUC: DCNv2 parallel bottom + LHUC + MMoE +
@@ -78,4 +124,7 @@ message LHUCRocketLaunchingMT {
     optional Similarity feature_distillation_function = 31 [default = COSINE];
     // weight applied to per-tower logit hint (MSE) loss
     optional float hint_loss_weight = 32 [default = 1.0];
+
+    // ===== AGE Exploration (inference only) =====
+    optional AGEExplorationConfig age_exploration = 40;
 }

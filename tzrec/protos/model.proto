@@ -96,6 +96,10 @@ message ModelConfig {
 
         DBMTL_DCNv2 dbmtl_dcnv2 = 208;
         DBMTL_LHUC dbmtl_lhuc = 209;
+        MTL_LHUC mtl_lhuc = 210;
+        MTL_APPNet mtl_appnet = 211;
+        MTL_APPNet_LHUC mtl_appnet_lhuc = 212;
+        MTL_APPNet_LHUC_CGC mtl_appnet_lhuc_cgc = 213;
     }
 
     optional uint32 num_class = 2 [default = 1];

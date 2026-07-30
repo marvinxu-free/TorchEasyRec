@@ -321,6 +321,180 @@ class LHUCRocketLaunchingMTTest(unittest.TestCase):
         for v in losses.values():
             self.assertEqual(v.dim(), 0)
 
+    def test_with_age_exploration(self) -> None:
+        """Test AGE exploration integration."""
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="cat_a", embedding_dim=16, num_buckets=100
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="cat_b", embedding_dim=8, num_buckets=1000
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="item_id", embedding_dim=16, num_buckets=1000
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(feature_name="int_a")
+            ),
+        ]
+        features = create_features(feature_cfgs)
+        feature_groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name="t1",
+                feature_names=["cat_a", "cat_b", "item_id", "int_a"],
+                group_type=model_pb2.FeatureGroupType.DEEP,
+            )
+        ]
+
+        cfg = _base_mt_config()
+        # Add AGE exploration config
+        age_cfg = general_rank_model_pb2.AGEExplorationConfig(
+            enable=True,
+            uncertainty_method="TS",
+            dropout_rate=0.01,
+            num_dropout_samples=5,  # Small for testing
+            use_pgd=True,
+            pgd_steps=2,  # Small for testing
+            epsilon=0.001,
+            item_feature_names=["item_id"],
+            soft_gate=False,
+            explore_task="is_click",
+        )
+        cfg.age_exploration.CopyFrom(age_cfg)
+
+        model_config = model_pb2.ModelConfig(
+            feature_groups=feature_groups,
+            lhuc_rocket_launching_mt=cfg,
+        )
+        model = LHUCRocketLaunchingMT(
+            model_config=model_config,
+            features=features,
+            labels=["is_click", "is_conversion"],
+        )
+        init_parameters(model, device=torch.device("cpu"))
+        model.eval()  # AGE exploration only runs at inference
+
+        batch = _make_batch()
+        predictions = model(batch)
+
+        # Basic checks
+        self.assertEqual(predictions["logits_is_click_light"].size(), (2,))
+        self.assertEqual(predictions["probs_is_click_light"].size(), (2,))
+
+    def test_age_exploration_feature_group(self) -> None:
+        """Test AGE exploration via item_feature_group (parallel feature group).
+
+        Defines a dedicated "item" feature group alongside the main "t1" group
+        and wires it through age_exploration.item_feature_group, instead of
+        listing item_feature_names inline.
+        """
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="cat_a", embedding_dim=16, num_buckets=100
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="cat_b", embedding_dim=8, num_buckets=1000
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="item_id", embedding_dim=16, num_buckets=1000
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(feature_name="int_a")
+            ),
+        ]
+        features = create_features(feature_cfgs)
+        feature_groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name="t1",
+                feature_names=["cat_a", "cat_b", "item_id", "int_a"],
+                group_type=model_pb2.FeatureGroupType.DEEP,
+            ),
+            # Parallel item-only group consumed by the AGE Dynamic Gating Unit.
+            # item_id also lives in "t1", so the embedding table is shared
+            # (deduped by embedding name) - no extra sparse parameters.
+            model_pb2.FeatureGroupConfig(
+                group_name="item",
+                feature_names=["item_id"],
+                group_type=model_pb2.FeatureGroupType.DEEP,
+            ),
+        ]
+
+        cfg = _base_mt_config()
+        age_cfg = general_rank_model_pb2.AGEExplorationConfig(
+            enable=True,
+            uncertainty_method="TS",
+            dropout_rate=0.01,
+            num_dropout_samples=5,
+            use_pgd=True,
+            pgd_steps=2,
+            epsilon=0.001,
+            item_feature_group="item",
+            soft_gate=False,
+            explore_task="is_click",
+        )
+        cfg.age_exploration.CopyFrom(age_cfg)
+
+        model_config = model_pb2.ModelConfig(
+            feature_groups=feature_groups,
+            lhuc_rocket_launching_mt=cfg,
+        )
+        model = LHUCRocketLaunchingMT(
+            model_config=model_config,
+            features=features,
+            labels=["is_click", "is_conversion"],
+        )
+        init_parameters(model, device=torch.device("cpu"))
+        model.eval()  # AGE exploration only runs at inference
+
+        # The explorer should resolve the "item" group for the DGU input.
+        self.assertEqual(model._age_item_feature_group, "item")
+        self.assertIsNone(model._age_item_feature_names)
+
+        batch = _make_batch()
+        predictions = model(batch)
+        self.assertEqual(predictions["logits_is_click_light"].size(), (2,))
+        self.assertEqual(predictions["probs_is_click_light"].size(), (2,))
+
+    def test_age_exploration_disabled(self) -> None:
+        """Test that AGE exploration can be disabled."""
+        feature_cfgs = _make_feature_configs()
+        features = create_features(feature_cfgs)
+        feature_groups = _make_feature_groups()
+
+        cfg = _base_mt_config()
+        # AGE disabled
+        age_cfg = general_rank_model_pb2.AGEExplorationConfig(
+            enable=False,
+        )
+        cfg.age_exploration.CopyFrom(age_cfg)
+
+        model_config = model_pb2.ModelConfig(
+            feature_groups=feature_groups,
+            lhuc_rocket_launching_mt=cfg,
+        )
+        model = LHUCRocketLaunchingMT(
+            model_config=model_config,
+            features=features,
+            labels=["is_click", "is_conversion"],
+        )
+        init_parameters(model, device=torch.device("cpu"))
+        model.eval()
+
+        # age_explorer should be None when disabled
+        self.assertIsNone(model.age_explorer)
+
 
 if __name__ == "__main__":
     unittest.main()

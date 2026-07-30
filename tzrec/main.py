@@ -330,6 +330,8 @@ def _train_and_evaluate(
     check_all_workers_data_status: bool = False,
     ignore_restore_optimizer: bool = False,
     dataloader_state: Optional[Dict[str, Any]] = None,
+    use_pcgrad: bool = False,
+    dense_params: Optional[List[torch.nn.Parameter]] = None,
 ) -> None:
     """Train and evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -431,6 +433,8 @@ def _train_and_evaluate(
             model,
             optimizer,
             check_all_workers_data_status=check_all_workers_data_status,
+            use_pcgrad=use_pcgrad,
+            dense_params=dense_params,
         )
         if plogger is not None:
             plogger.set_description(f"Training Epoch {i_epoch}")
@@ -752,6 +756,18 @@ def train_and_evaluate(
         grad_scaler=grad_scaler,
         gradient_accumulation_steps=train_config.gradient_accumulation_steps,
     )
+    # PCGrad: collect dense (non-fused-sparse) parameters for gradient
+    # projection. dense_params = remaining_params + all part_optim_params.
+    use_pcgrad = bool(getattr(model.module.model, "_use_pcgrad", False))
+    dense_params: List[torch.nn.Parameter] = []
+    if use_pcgrad:
+        for p in remaining_params.values():
+            if p.requires_grad:
+                dense_params.append(p)
+        for group in part_optim_params:
+            for p in group.values():
+                if p.requires_grad:
+                    dense_params.append(p)
     sparse_lr = optimizer_builder.create_scheduler(
         model.fused_optimizer, train_config.sparse_optimizer
     )
@@ -791,6 +807,8 @@ def train_and_evaluate(
         check_all_workers_data_status=check_all_workers_data_status,
         ignore_restore_optimizer=ignore_restore_optimizer,
         dataloader_state=dataloader_state,
+        use_pcgrad=use_pcgrad,
+        dense_params=dense_params,
     )
     if is_local_rank_zero:
         logger.info("Train and Evaluate Finished.")

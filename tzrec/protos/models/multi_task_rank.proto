@@ -4,6 +4,7 @@ package tzrec.protos;
 import "tzrec/protos/module.proto";
 import "tzrec/protos/tower.proto";
 import "tzrec/protos/loss.proto";
+import "tzrec/protos/metric.proto";
 import "tzrec/protos/models/rank_model.proto";
 
 message SimpleMultiTask {
@@ -126,6 +127,245 @@ message DBMTL_LHUC {
     optional SampleWeightFusion sample_weight_fusion = 9;
     // extensible bias auxiliary tasks (predict bias fields as labels)
     repeated BiasTask bias_tasks = 13;
+    // enable PCGrad multi-task loss fusion (per-task gradient projection on
+    // dense params); when set, model._use_pcgrad is True so TrainWrapper
+    // returns a per-task loss stack and the PCGrad train pipeline is used.
+    optional PCGradConfig pcgrad = 14;
+}
+
+// Task tower with per-tower LHUC personalization gate and optional
+// DBMTL-style concat dependency. Field names/semantics mirror
+// TaskTower / BayesTaskTower; duplicated here to keep the message
+// self-contained (avoids cross-file proto moves that would break
+// existing _pb2 import paths).
+message LHUCTaskTower {
+    // task name for the task tower
+    required string tower_name = 1;
+    // label for the task
+    required string label_name = 2;
+    // metrics for the task
+    repeated MetricConfig metrics = 3;
+    // log train metrics for task
+    repeated TrainMetricConfig train_metrics = 20;
+    // loss for the task
+    repeated LossConfig losses = 4;
+    // num_class for multi-class classification loss
+    optional uint32 num_class = 5 [default = 1];
+    // task specific mlp (applied after LHUC PP net)
+    optional MLP mlp = 6;
+    // training loss weight
+    optional float weight = 7 [default = 1.0];
+    // sample weight for the task
+    optional string sample_weight_name = 8;
+    // label name for indicating the sample space for the task tower
+    optional string task_space_indicator_label = 9;
+    // the loss weight for sample in the task space
+    optional float in_task_space_weight = 10 [default = 1.0];
+    // the loss weight for sample out the task space
+    optional float out_task_space_weight = 11 [default = 1.0];
+    // DBMTL concat dependency: parent tower names (must be declared earlier)
+    repeated string relation_tower_names = 13;
+    // MLP over concat(self_repr, *parent_repr) for DBMTL dependency
+    optional MLP relation_mlp = 14;
+    // per-tower LHUC EP gate (independent bias feature set)
+    optional LHUCEPGateConfig lhuc_gate = 15;
+    // per-tower LHUC PP net (replaces the plain MLP pathway when set)
+    optional LHUCPPNetConfig lhuc_pp_net = 16;
+    // feature_group name whose concatenated embeddings feed this tower's
+    // lhuc_gate / lhuc_pp_net. Declared as a top-level feature_groups entry
+    // (features may overlap with the main group; embeddings are shared).
+    optional string bias_feature_group = 17;
+}
+
+// ESMM dependency: CTCVR = sigmoid(CTR) * sigmoid(CVR).
+// The CVR tower has no direct loss; it is supervised only through the
+// CTCVR BCE loss against the (click & conversion) joint label.
+message ESMMConfig {
+    // CTR tower name (supervised with full-impression BCE)
+    required string ctr_tower_name = 1;
+    // CVR tower name (no direct loss; supervised via CTCVR)
+    required string cvr_tower_name = 2;
+    // joint label field for CTCVR; defaults to the CVR tower's label_name
+    optional string ctcvr_label_name = 3;
+    // CTCVR loss weight
+    optional float weight = 4 [default = 1.0];
+}
+
+// PCGrad multi-task loss fusion config.
+message PCGradConfig {
+    // presence of this message enables PCGrad; the flag is kept for clarity
+    optional bool enabled = 1 [default = true];
+}
+
+message MTL_LHUC {
+    // shared bottom MaskNet module
+    optional MaskNetModule mask_net = 1;
+    // feature-cross MLP branch (parallel with dcnv2)
+    optional MLP bottom_mlp = 2;
+    // feature-cross DCNv2 branch
+    required CrossV2 dcnv2 = 3;
+    // stacked PLE / CGC extraction networks
+    repeated ExtractionNetwork extraction_networks = 4;
+    // per-tower LHUC task towers
+    repeated LHUCTaskTower task_towers = 5;
+    // ESMM dependency (mutually exclusive with per-tower relation_mlp)
+    optional ESMMConfig esmm = 6;
+    // sample weight fusion config
+    optional SampleWeightFusion sample_weight_fusion = 7;
+    // extensible bias auxiliary tasks (predict bias fields as labels)
+    repeated BiasTask bias_tasks = 8;
+    // PCGrad loss fusion config
+    optional PCGradConfig pcgrad = 9;
+}
+
+// APPNet (WSDM'26) Automatic Feature Partitioning config.
+// Learns a binary mask over feature fields (or bits) via STE, splitting the
+// embedding into a PPNet stream (S) and a DNN stream (O).
+message AFPConfig {
+    enum AFPMode {
+        FEATURE_WISE = 0;
+        BIT_WISE = 1;
+    }
+    // partition granularity: per feature field or per embedding bit
+    optional AFPMode mode = 1 [default = FEATURE_WISE];
+    // binarisation threshold lambda (paper best range 0.6-0.8)
+    optional float threshold = 2 [default = 0.7];
+    // apply LayerNorm before partitioning (essential per Table 3 ablation)
+    optional bool use_layer_norm = 3 [default = true];
+}
+
+// APPNet Gate Neural Unit config (g = gamma * sigmoid(...)).
+message APPNetPPNetConfig {
+    // hidden widths of each GateNU (cycled if fewer than DNN layers)
+    repeated uint32 gate_hidden_units = 1;
+    // multiplicative scaling factor gamma (gate centred at 1 at init)
+    optional float gamma = 2 [default = 2.0];
+    // activation name for the GNU hidden layer
+    optional string activation = 3 [default = "nn.ReLU"];
+}
+
+// Per-task APPNet tower: DCNv2(O) -> gated DNN, gated by PPNet(S).
+message APPNetTower {
+    // task name for the task tower
+    required string tower_name = 1;
+    // label for the task
+    required string label_name = 2;
+    // metrics for the task
+    repeated MetricConfig metrics = 3;
+    // log train metrics for task
+    repeated TrainMetricConfig train_metrics = 20;
+    // loss for the task
+    repeated LossConfig losses = 4;
+    // num_class for multi-class classification loss
+    optional uint32 num_class = 5 [default = 1];
+    // per-tower DCNv2 cross applied to the DNN stream O
+    required CrossV2 dcnv2 = 6;
+    // gated DNN hidden layer widths, e.g. [512, 256, 128]
+    repeated uint32 dnn_hidden_units = 7;
+    // apply LayerNorm after DCNv2
+    optional bool dnn_use_ln = 8 [default = true];
+    // dropout ratio after each DNN layer
+    optional float dnn_dropout_ratio = 9 [default = 0.0];
+    // PPNet gate config; if unset, no per-layer gating is applied
+    optional APPNetPPNetConfig pp_net = 10;
+    // training loss weight
+    optional float weight = 11 [default = 1.0];
+    // sample weight for the task
+    optional string sample_weight_name = 12;
+    // label name for indicating the sample space for the task tower
+    optional string task_space_indicator_label = 13;
+    // the loss weight for sample in the task space
+    optional float in_task_space_weight = 14 [default = 1.0];
+    // the loss weight for sample out the task space
+    optional float out_task_space_weight = 15 [default = 1.0];
+    // DBMTL concat dependency: parent tower names (must be declared earlier)
+    repeated string relation_tower_names = 16;
+    // MLP over concat(self_repr, *parent_repr) for DBMTL dependency
+    optional MLP relation_mlp = 17;
+}
+
+// MTL_APPNet: AFP-partitioned embedding -> per-tower DCNv2 + PPNet-gated DNN.
+// Supports ESMM / DBMTL (relation_mlp) / independent task towers.
+message MTL_APPNet {
+    // shared bottom MaskNet module (applied to the raw embedding)
+    optional MaskNetModule mask_net = 1;
+    // Automatic Feature Partitioning module (required)
+    required AFPConfig afp = 2;
+    // per-tower APPNet towers
+    repeated APPNetTower task_towers = 3;
+    // ESMM dependency (mutually exclusive with per-tower relation_mlp)
+    optional ESMMConfig esmm = 4;
+    // sample weight fusion config
+    optional SampleWeightFusion sample_weight_fusion = 5;
+    // extensible bias auxiliary tasks (predict bias fields as labels)
+    repeated BiasTask bias_tasks = 6;
+    // PCGrad loss fusion config
+    optional PCGradConfig pcgrad = 7;
+}
+
+// AFP + LHUC variant of APPNetTower: DCNv2(O) -> LHUCEPGate(S) ->
+// LHUCPPNet(x, S) -> [MLP]. Uses the project's battle-tested LHUC modules
+// (tzrec/modules/lhuc.py) instead of the paper-faithful GateNU/APPNetPPNet;
+// the AFP stream S is the gate_input (replacing MTL_LHUC's manual
+// bias_feature_group).
+message AFPPLhucTower {
+    // task name for the task tower
+    required string tower_name = 1;
+    // label for the task
+    required string label_name = 2;
+    // metrics for the task
+    repeated MetricConfig metrics = 3;
+    // log train metrics for task
+    repeated TrainMetricConfig train_metrics = 20;
+    // loss for the task
+    repeated LossConfig losses = 4;
+    // num_class for multi-class classification loss
+    optional uint32 num_class = 5 [default = 1];
+    // per-tower DCNv2 cross applied to the DNN stream O
+    required CrossV2 dcnv2 = 6;
+    // apply LayerNorm after DCNv2
+    optional bool dnn_use_ln = 7 [default = true];
+    // LHUC embedding personalization gate (required); gate_input = AFP stream S
+    required LHUCEPGateConfig lhuc_ep_gate = 8;
+    // LHUC parameter personalization net (gated DNN); gate_input = AFP stream S
+    optional LHUCPPNetConfig lhuc_pp_net = 9;
+    // optional task MLP applied after the PP net
+    optional MLP mlp = 10;
+    // training loss weight
+    optional float weight = 11 [default = 1.0];
+    // sample weight for the task
+    optional string sample_weight_name = 12;
+    // label name for indicating the sample space for the task tower
+    optional string task_space_indicator_label = 13;
+    // the loss weight for sample in the task space
+    optional float in_task_space_weight = 14 [default = 1.0];
+    // the loss weight for sample out the task space
+    optional float out_task_space_weight = 15 [default = 1.0];
+    // DBMTL concat dependency: parent tower names (must be declared earlier)
+    repeated string relation_tower_names = 16;
+    // MLP over concat(self_repr, *parent_repr) for DBMTL dependency
+    optional MLP relation_mlp = 17;
+}
+
+// MTL_APPNet_LHUC: AFP-partitioned embedding -> per-tower DCNv2 + LHUC-gated
+// DNN. Same AFP partitioning as MTL_APPNet but swaps the in-afp PPNet for the
+// project's LHUCEPGate + LHUCPPNet. Supports ESMM / DBMTL (relation_mlp) /
+// independent task towers.
+message MTL_APPNet_LHUC {
+    // shared bottom MaskNet module (applied to the raw embedding)
+    optional MaskNetModule mask_net = 1;
+    // Automatic Feature Partitioning module (required)
+    required AFPConfig afp = 2;
+    // per-tower AFP + LHUC towers
+    repeated AFPPLhucTower task_towers = 3;
+    // ESMM dependency (mutually exclusive with per-tower relation_mlp)
+    optional ESMMConfig esmm = 4;
+    // sample weight fusion config
+    optional SampleWeightFusion sample_weight_fusion = 5;
+    // extensible bias auxiliary tasks (predict bias fields as labels)
+    repeated BiasTask bias_tasks = 6;
+    // PCGrad loss fusion config
+    optional PCGradConfig pcgrad = 7;
 }
 
 message DC2VR {
@@ -210,4 +450,73 @@ message PEPNet {
     optional uint32 task_domain_num = 8 [default = 1];
     // task tower
     repeated TaskTower task_towers = 9;
+}
+
+// Task-tower head for MTL_APPNet_LHUC_CGC (post-CGC). Cross/LHUC gating is
+// shared (model-level); this head carries per-tower mlp, relation_mlp,
+// sample weights, and bias-task support.
+message AFPPLhucCGCTower {
+    // task name for the task tower
+    required string tower_name = 1;
+    // label for the task
+    required string label_name = 2;
+    // metrics for the task
+    repeated MetricConfig metrics = 3;
+    // log train metrics for task
+    repeated TrainMetricConfig train_metrics = 20;
+    // loss for the task
+    repeated LossConfig losses = 4;
+    // num_class for multi-class classification loss
+    optional uint32 num_class = 5 [default = 1];
+    // per-task MLP applied on the per-task rep after CGC (pre-relation_mlp)
+    optional MLP mlp = 6;
+    // training loss weight
+    optional float weight = 7 [default = 1.0];
+    // sample weight for the task
+    optional string sample_weight_name = 8;
+    // label name for indicating the sample space for the task tower
+    optional string task_space_indicator_label = 9;
+    optional float in_task_space_weight = 10 [default = 1.0];
+    optional float out_task_space_weight = 11 [default = 1.0];
+    // DBMTL concat dependency: parent tower names (must be declared earlier)
+    repeated string relation_tower_names = 12;
+    // MLP over concat(self_repr, *parent_repr) for DBMTL dependency
+    optional MLP relation_mlp = 13;
+}
+
+// MTL_APPNet_LHUC_CGC: AFP -> 3 parallel branches (DCNv2 || bottom_mlp ||
+// CompressedDOT) -> shared LHUC EP gate + LHUCPPNet -> stacked CGC extraction
+// networks -> per-tower heads with optional DBMTL relation_mlp and ESMM CTCVR.
+message MTL_APPNet_LHUC_CGC {
+    // shared bottom MaskNet module (applied to the raw embedding)
+    optional MaskNetModule mask_net = 1;
+    // Automatic Feature Partitioning module (required)
+    required AFPConfig afp = 2;
+    // feature-cross DCNv2 branch (applied to O)
+    required CrossV2 dcnv2 = 3;
+    // optional bottom_mlp branch (applied to O) -- dcn+dnn+cdot in parallel
+    optional MLP bottom_mlp = 4;
+    // feature group name whose concatenated embeddings feed CompressedDOT
+    // (must be a separate feature_groups entry; all features in the group
+    // must share the same embedding dim; group_total_dim == num_slots*D)
+    required string cdot_group_name = 5;
+    // CompressedDOT config (output_dim per slot, etc.)
+    required CDOTConfig cdot = 6;
+    // shared LHUC EP gate (gate_input = AFP stream S, replaces manual
+    // bias_feature_group)
+    required LHUCEPGateConfig lhuc_gate = 7;
+    // shared LHUC PP net (gated DNN; gate_input = S)
+    optional LHUCPPNetConfig lhuc_pp_net = 8;
+    // stacked PLE / CGC extraction networks
+    repeated ExtractionNetwork extraction_networks = 9;
+    // per-tower AFP + LHUC + CGC heads
+    repeated AFPPLhucCGCTower task_towers = 10;
+    // ESMM dependency
+    optional ESMMConfig esmm = 11;
+    // sample weight fusion config
+    optional SampleWeightFusion sample_weight_fusion = 12;
+    // extensible bias auxiliary tasks
+    repeated BiasTask bias_tasks = 13;
+    // PCGrad loss fusion config
+    optional PCGradConfig pcgrad = 14;
 }

@@ -218,6 +218,148 @@ class TrainPipelineBase(_TrainPipelineBase):
         _pipeline_backward(losses, self._optimizer)
 
 
+def _pcgrad_backward(
+    losses: torch.Tensor,
+    optimizer: torch.optim.Optimizer,
+    dense_params: List[torch.nn.Parameter],
+) -> None:
+    """PCGrad backward: project per-task dense grads, keep sparse grads standard.
+
+    Contract: ``losses`` is a 1-D tensor with one scalar per task (produced by
+    ``TrainWrapper`` when ``model._use_pcgrad`` is True).
+
+    Steps:
+        1. Extract per-task dense grads via ``torch.autograd.grad`` (does NOT
+           fire the fused in-backward sparse optimizer nor DDP grad-sync hooks).
+        2. PCGrad-project the per-task dense grads to remove conflicts.
+        3. Run the real-graph ``backward`` on the summed loss: this populates
+           sparse embedding grads (standard sum) and fires the fused sparse
+           optimizer in-backward, plus a single DDP all-reduce.
+        4. Overwrite each dense param's ``.grad`` with the projected+summed
+           target (scaled to match the GradScaler), so the subsequent
+           ``optimizer.step()`` steps dense params with PCGrad gradients.
+    """
+    from tzrec.loss.pcgrad import (
+        flatten_grads_with_zeros,
+        pcgrad_project,
+        write_grads,
+    )
+
+    with record_function("## pcgrad backward ##"):
+        assert losses.dim() == 1, (
+            f"PCGrad expects a 1-D per-task loss tensor, got shape {losses.shape}"
+        )
+        accum = getattr(optimizer, "_gradient_accumulation_steps", 0) or 0
+        assert accum <= 1, (
+            "PCGrad does not support gradient_accumulation_steps > 1 yet; "
+            "set train_config.gradient_accumulation_steps = 0 or 1 to use pcgrad."
+        )
+        scaler = getattr(optimizer, "_grad_scaler", None)
+
+        # Only params that require grad can be differentiated; frozen params
+        # (requires_grad=False) would raise inside autograd.grad, so filter
+        # them out. They have no gradient to project either way.
+        dense_params = [p for p in dense_params if p.requires_grad]
+        zero_flat = (
+            torch.zeros(
+                sum(p.numel() for p in dense_params),
+                device=losses.device,
+            )
+            if dense_params
+            else None
+        )
+
+        # losses layout (see TrainWrapper.forward): indices [:-1] are main
+        # task tower losses to PCGrad-project; the LAST element is the summed
+        # auxiliary loss (bias heads + dropout regularizers) whose dense grad
+        # is added to the projected target WITHOUT projection.
+        main_losses = losses[:-1]
+        aux_loss = losses[-1]
+
+        # 1. per-main-task dense grads (unscaled, real graph retained for backward)
+        per_task_flat = []
+        for i in range(main_losses.shape[0]):
+            # A non-grad loss entry (e.g. a constant term) contributes nothing;
+            # skip autograd.grad for it (it would otherwise raise) and use zeros.
+            if not main_losses[i].requires_grad or not dense_params:
+                per_task_flat.append(zero_flat)
+                continue
+            grads = torch.autograd.grad(
+                main_losses[i],
+                dense_params,
+                retain_graph=True,
+                allow_unused=True,
+                create_graph=False,
+            )
+            per_task_flat.append(flatten_grads_with_zeros(grads, dense_params))
+
+        # 2. project + sum the MAIN task grads
+        proj = pcgrad_project(per_task_flat)
+        target_dense = torch.stack(proj).sum(dim=0)
+
+        # 2b. add the aux loss's dense grad WITHOUT projection. The real-graph
+        #     backward below (torch.sum over all elements) drives sparse params
+        #     with aux's gradient; but step 4 overwrites dense .grad, so the
+        #     aux dense grad must be folded into target_dense to survive.
+        if aux_loss.requires_grad and dense_params:
+            aux_grads = torch.autograd.grad(
+                aux_loss,
+                dense_params,
+                retain_graph=True,
+                allow_unused=True,
+                create_graph=False,
+            )
+            target_dense = target_dense + flatten_grads_with_zeros(
+                aux_grads, dense_params
+            )
+
+        # 3. real-graph backward for sparse params + DDP sync. torch.sum over
+        #    all elements includes the aux loss, so sparse params receive the
+        #    aux gradient (correct: aux is a regularizer that should train them).
+        loss = torch.sum(losses, dim=0)
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        # 4. overwrite dense .grad with projected target (scaler-scaled so the
+        #    scaler's upcoming unscale_ divides it back to the true magnitude).
+        #
+        # IMPORTANT (multi-GPU correctness): the per-task grads above were
+        # extracted via ``torch.autograd.grad``, which does NOT trigger DDP
+        # gradient sync. The real-graph ``backward`` in step 3 did fire DDP
+        # all-reduce on the dense grads, but we are about to overwrite that
+        # result with ``target_dense`` — which is still LOCAL to this rank.
+        # Without an explicit all-reduce here, each rank would step its dense
+        # params on its own local-batch projected gradient, breaking DDP's
+        # "all ranks apply the same averaged update" invariant: effective
+        # batch size degrades from world_size*B to B and dense params drift
+        # apart across ranks. All-reduce the projected target so dense grads
+        # get the same global averaging that sparse grads (via step 3) get.
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(target_dense, op=dist.ReduceOp.SUM)
+            target_dense = target_dense / dist.get_world_size()
+        scale = scaler.get_scale() if scaler is not None else 1.0
+        write_grads(dense_params, target_dense, scale=scale)
+
+
+class PCGradMixin:
+    """Mixin enabling PCGrad backward; set ``self._dense_params`` before use."""
+
+    _dense_params: List[torch.nn.Parameter] = []
+
+    def set_dense_params(self, params: List[torch.nn.Parameter]) -> None:
+        """Inject the list of dense (non-fused-sparse) parameters to project."""
+        self._dense_params = params
+
+    def _backward(self, losses: torch.Tensor) -> None:
+        _pcgrad_backward(losses, self._optimizer, self._dense_params)
+
+
+class TrainPipelinePCGradBase(PCGradMixin, TrainPipelineBase):
+    """PCGrad variant of TrainPipelineBase (no sparse modules)."""
+
+
 class TrainPipelineSparseDist(_TrainPipelineSparseDist):
     """TorchEasyRec's TrainPipelineSparseDist, make backward support grad scaler."""
 
@@ -302,6 +444,13 @@ class TrainPipelineSparseDist(_TrainPipelineSparseDist):
         _pipeline_backward(losses, self._optimizer)
 
 
+class TrainPipelinePCGradSparseDist(PCGradMixin, TrainPipelineSparseDist):
+    """PCGrad variant of TrainPipelineSparseDist.
+
+    Defined after :class:`TrainPipelineSparseDist` since it subclasses it.
+    """
+
+
 class PredictPipelineSparseDist(_TrainPipelineSparseDist):
     """TorchEasyRec's PredictPipelineSparseDist, make predict do not hang."""
 
@@ -336,6 +485,8 @@ def create_train_pipeline(
     model: nn.Module,
     optimizer: Optional[torch.optim.Optimizer] = None,
     check_all_workers_data_status: bool = False,
+    use_pcgrad: bool = False,
+    dense_params: Optional[List[torch.nn.Parameter]] = None,
 ) -> TrainPipeline:
     """Create TrainPipeline.
 
@@ -344,6 +495,10 @@ def create_train_pipeline(
         optimizer (torch.optim.Optimizer): a KeyedOptimizer.
         check_all_workers_data_status (bool): check data on all workers
             is available or not.
+        use_pcgrad (bool): when True, use a TrainPipeline variant whose backward
+            applies PCGrad over per-task dense gradients.
+        dense_params (list, optional): dense (non-fused-sparse) parameters
+            required by the PCGrad backward path.
 
     Return:
         a TrainPipeline.
@@ -363,9 +518,24 @@ def create_train_pipeline(
 
     if not has_sparse_module:
         # use TrainPipelineBase when model do not have sparse parameters.
+        if use_pcgrad:
+            pipeline = TrainPipelinePCGradBase(model, optimizer, model.device)
+            pipeline.set_dense_params(dense_params or [])
+            return pipeline
         # pyre-ignore [6]
         return TrainPipelineBase(model, optimizer, model.device)
     else:
+        if use_pcgrad:
+            pipeline = TrainPipelinePCGradSparseDist(
+                model,
+                # pyre-ignore [6]
+                optimizer,
+                model.device,
+                execute_all_batches=True,
+                check_all_workers_data_status=check_all_workers_data_status,
+            )
+            pipeline.set_dense_params(dense_params or [])
+            return pipeline
         return TrainPipelineSparseDist(
             model,
             # pyre-ignore [6]

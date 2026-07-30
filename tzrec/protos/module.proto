@@ -342,3 +342,15 @@ message HSTU {
     // tables multiply sparse-param + TBE + all-to-all cost by N.
     optional string name = 9 [default = ""];
 }
+
+// Compressed DOT config -- operates on a feature group whose fields all share
+// the same embedding dim. The model wires the group at __init__ time via
+// cdot_group_name; the group_total_dim must equal num_slots * slot_dim.
+message CDOTConfig {
+    // output dimension per slot after the compressed interaction
+    required uint32 output_dim = 1;
+    // intermediate dim for sub_compress [num_slots -> mid_dim]
+    optional uint32 mid_dim = 2 [default = 32];
+    // hidden units for the compress-tower MLP
+    repeated uint32 compress_hidden_units = 3;
+}

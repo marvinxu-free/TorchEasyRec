@@ -96,6 +96,11 @@ class DBMTL_LHUC(MultiTaskRank):
         self.group_name = self.embedding_group.group_names()[0]
         feature_in = self.embedding_group.group_total_dim(self.group_name)
 
+        # PCGrad flag (consumed by TrainWrapper / TrainPipelinePCGrad).
+        # Mirrors MTL_LHUC: setting model_config.pcgrad opts this model into
+        # per-task gradient projection over dense params.
+        self._use_pcgrad = self._model_config.HasField("pcgrad")
+
         # MaskNet module (optional)
         self.mask_net = None
         if self._model_config.HasField("mask_net"):

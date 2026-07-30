@@ -47,6 +47,7 @@ from tzrec.modules.lhuc import LHUCEPGate, LHUCPPNet
 from tzrec.modules.masknet import MaskNetModule
 from tzrec.modules.mlp import MLP
 from tzrec.modules.mmoe import MMoE as MMoEModule
+from tzrec.modules.age_explorer import AGEExplorer
 from tzrec.modules.utils import div_no_nan
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import general_rank_model_pb2, multi_task_rank_pb2
@@ -112,6 +113,9 @@ class LHUCRocketLaunchingMT(MultiTaskRank):
 
         # ===== Distillation index per tower =====
         self._distill_index = self._get_distillation_index()
+
+        # ===== AGE Exploration (inference only) =====
+        self._build_age_explorer(feature_in)
 
     # ------------------------------------------------------------------ #
     # Component construction
@@ -349,6 +353,96 @@ class LHUCRocketLaunchingMT(MultiTaskRank):
                 index[task_tower_cfg.tower_name] = pair
         return index
 
+    def _build_age_explorer(self, feature_in: int) -> None:
+        """Build AGE exploration module (inference only)."""
+        self.age_explorer = None
+
+        if not self._model_config.HasField("age_exploration"):
+            return
+
+        age_cfg = self._model_config.age_exploration
+        if not age_cfg.enable:
+            return
+
+        # Get item feature dimension for DGU
+        # Priority: item_feature_group > item_feature_names
+        item_feature_group = age_cfg.item_feature_group if age_cfg.item_feature_group else None
+
+        if item_feature_group:
+            # Use feature group - get total dimension directly
+            if item_feature_group not in self.embedding_group.group_names():
+                raise ValueError(
+                    f"AGE item_feature_group '{item_feature_group}' not found. "
+                    f"Available groups: {self.embedding_group.group_names()}"
+                )
+            item_feature_dim = self.embedding_group.group_total_dim(item_feature_group)
+            self._age_item_feature_group = item_feature_group
+            self._age_item_feature_names = None
+        else:
+            # Legacy way: use item_feature_names
+            item_feature_names = list(age_cfg.item_feature_names) if age_cfg.item_feature_names else []
+            if not item_feature_names:
+                # Default: use item_id as the item feature
+                item_feature_names = ["item_id"]
+
+            all_feature_dims = self.embedding_group.group_feature_dims(self.group_name)
+            item_feature_dim = 0
+            self._age_item_feature_names = []
+            for fname in item_feature_names:
+                if fname in all_feature_dims:
+                    item_feature_dim += all_feature_dims[fname]
+                    self._age_item_feature_names.append(fname)
+
+            if item_feature_dim == 0:
+                raise ValueError(
+                    f"No valid item features found for AGE exploration. "
+                    f"Configured: {item_feature_names}, Available: {list(all_feature_dims.keys())}"
+                )
+            self._age_item_feature_group = None
+
+        # Create AGE Explorer
+        self.age_explorer = AGEExplorer(
+            embedding_dim=feature_in,
+            item_feature_dim=item_feature_dim,
+            dropout_rate=age_cfg.dropout_rate,
+            num_samples=age_cfg.num_dropout_samples,
+            use_pgd=age_cfg.use_pgd,
+            pgd_steps=age_cfg.pgd_steps,
+            epsilon=age_cfg.epsilon,
+            uncertainty_method=age_cfg.uncertainty_method,
+        )
+
+        # Store explore task name
+        self._age_explore_task = age_cfg.explore_task if age_cfg.explore_task else None
+
+    def _extract_item_features(self, grouped_features: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Extract item features for DGU from grouped features."""
+        # Priority: feature group > feature names
+        if hasattr(self, "_age_item_feature_group") and self._age_item_feature_group:
+            # Use feature group directly
+            return grouped_features[self._age_item_feature_group]
+
+        if not hasattr(self, "_age_item_feature_names") or not self._age_item_feature_names:
+            # Fallback: use all features if no item features specified
+            return grouped_features[self.group_name]
+
+        # Extract only item features (legacy way)
+        parts = []
+        for fname in self._age_item_feature_names:
+            # Feature might be in grouped features or need to be looked up
+            if fname in grouped_features:
+                parts.append(grouped_features[fname])
+            else:
+                # Try to get from the main group
+                # This is a simplified version - in practice might need more handling
+                pass
+
+        if not parts:
+            # Fallback to all features
+            return grouped_features[self.group_name]
+
+        return torch.cat(parts, dim=-1)
+
     # ------------------------------------------------------------------ #
     # Forward helpers
     # ------------------------------------------------------------------ #
@@ -529,6 +623,26 @@ class LHUCRocketLaunchingMT(MultiTaskRank):
 
         # Light branch (training + inference)
         light_logits, light_hidden = self._light_forward(net)
+
+        # Apply AGE exploration at inference time.
+        # AGE uses torch.autograd.grad to compute adversarial gradients, which
+        # cannot be FX-traced or TorchScript-scripted (aten::grad rejects the
+        # only_inputs / is_grads_batched kwargs that the Python API defaults).
+        # Skip the whole branch during export so the scripted model emits the
+        # base light_logits; AGE remains active in eager eval/inference.
+        _skip_age = self.training
+        if not _skip_age:
+            _skip_age = torch.jit.is_scripting() or torch.jit.is_tracing()
+        if not _skip_age:
+            try:
+                _skip_age = bool(torch.fx.is_tracing())
+            except Exception:
+                _skip_age = False
+        if self.age_explorer is not None and not _skip_age:
+            light_logits = self._apply_age_exploration(
+                net, light_logits, grouped_features
+            )
+
         predictions = self._tower_outputs_to_predictions(light_logits, "_light")
         if self._feature_based_distillation:
             for tower_name, layers in light_hidden.items():
@@ -546,6 +660,60 @@ class LHUCRocketLaunchingMT(MultiTaskRank):
                     for j, feat in layers.items():
                         predictions[f"booster_{tower_name}_{j}"] = feat
         return predictions
+
+    def _apply_age_exploration(
+        self,
+        net: torch.Tensor,
+        light_logits: Dict[str, torch.Tensor],
+        grouped_features: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Apply AGE exploration at inference time.
+
+        Args:
+            net: [batch_size, embedding_dim] concatenated embedding input.
+            light_logits: [batch_size] dict of tower logits.
+            grouped_features: dict of grouped features.
+
+        Returns:
+            Modified light_logits with exploration applied.
+        """
+        # Determine which task to apply exploration
+        explore_task = self._age_explore_task
+        if explore_task is None:
+            # Apply to first task by default
+            explore_task = self._task_tower_cfgs[0].tower_name
+
+        if explore_task not in light_logits:
+            return light_logits
+
+        # Get main prediction (sigmoid probability)
+        main_logits = light_logits[explore_task]
+        main_pctr = torch.sigmoid(main_logits)
+
+        # Extract item features for DGU
+        item_embeddings = self._extract_item_features(grouped_features)
+
+        # Define forward function for AGE explorer
+        def forward_fn(emb):
+            # Quick forward through light branch only
+            temp_logits, _ = self._light_forward(emb)
+            return temp_logits.get(explore_task, temp_logits[list(temp_logits.keys())[0]])
+
+        # Run AGE exploration
+        age_result = self.age_explorer(
+            embeddings=net,
+            item_embeddings=item_embeddings,
+            main_prediction=main_pctr,
+            forward_fn=forward_fn,
+        )
+
+        # Apply exploration prediction
+        exploration_pctr = age_result["exploration_prediction"]
+
+        # Convert back to logits
+        light_logits[explore_task] = torch.logit(exploration_pctr.clamp(min=1e-8, max=1-1e-8))
+
+        return light_logits
 
     def init_loss(self) -> None:
         """Initialize loss modules for booster/light towers, bias tasks, hints."""
