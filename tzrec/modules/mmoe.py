@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -57,21 +57,39 @@ class MMoE(nn.Module):
         """Output dimension of the module."""
         return self.expert_mlps[0].hidden_units[-1]
 
-    def forward(self, input: torch.Tensor) -> List[torch.Tensor]:
-        """Forward the module."""
+    def forward(
+        self, input: torch.Tensor, return_gates: bool = False
+    ) -> Union[List[torch.Tensor], Tuple[List[torch.Tensor], List[torch.Tensor]]]:
+        """Forward the module.
+
+        Args:
+            input (torch.Tensor): [batch_size, in_features].
+            return_gates (bool): when True, also return the per-task softmax
+                gate weight vectors (each [batch_size, num_expert]) alongside
+                the per-task gated inputs. Default False keeps the historical
+                return signature (list of per-task inputs).
+
+        Return:
+            A list of per-task gated inputs, or -- when ``return_gates`` is set
+            -- a ``(per_task_inputs, per_task_gates)`` tuple.
+        """
         expert_fea_list = []
         for i in range(self.num_expert):
             expert_fea_list.append(self.expert_mlps[i](input))
         expert_feas = torch.stack(expert_fea_list, dim=1)
 
         result = []
+        gates = []
         for i in range(self.num_task):
             if self.has_gate_mlp:
                 gate = self.gate_mlps[i](input)
             else:
                 gate = input
             gate = self.gate_finals[i](gate)
-            gate = F.softmax(gate, dim=1).unsqueeze(1)
-            task_input = torch.matmul(gate, expert_feas).squeeze(1)
+            gate_w = F.softmax(gate, dim=1)  # [B, num_expert]
+            task_input = torch.matmul(gate_w.unsqueeze(1), expert_feas).squeeze(1)
             result.append(task_input)
+            gates.append(gate_w)
+        if return_gates:
+            return result, gates
         return result

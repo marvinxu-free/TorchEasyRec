@@ -128,3 +128,37 @@ message LHUCRocketLaunchingMT {
     // ===== AGE Exploration (inference only) =====
     optional AGEExplorationConfig age_exploration = 40;
 }
+
+message MTLRocketLaunching {
+    // ===== Shared bottom (booster & light; light uses detached output so
+    // share_mlp gradients flow only from the booster) =====
+    optional MLP share_mlp = 1;
+
+    // ===== Booster (teacher, training only) trunk. All stages are OPTIONAL so
+    // the trunk can be freely composed, e.g.:
+    //   cross -> deep -> ple -> towers   (full)
+    //   deep -> ple -> towers            (no cross)
+    //   cross -> deep -> towers          (no ple)
+    //   ple -> towers / deep -> towers / ... (any subset; even no trunk)
+    // The trunk is applied in order: cross -> deep -> ple. =====
+    optional CrossV2 cross = 2;
+    optional MLP deep = 3;
+    // stacked PLE / CGC extraction networks (empty = skip ple)
+    repeated ExtractionNetwork extraction_networks = 4;
+    // parallel multi-task towers, e.g. ctr_tower + cvr_tower; the declaration
+    // is shared by booster and light (tower_name / label_name / losses / weight).
+    repeated TaskTower task_towers = 5;
+
+    // ===== Light (student, training + inference): share.detach() -> light_mlp
+    // -> per-tower heads. Only light is served online. =====
+    required MLP light_mlp = 20;
+    // optional per-tower light head MLP
+    optional MLP light_task_mlp = 21;
+
+    // ===== Distillation (mirrors RocketLaunching2) =====
+    optional bool feature_based_distillation = 30 [default = false];
+    // COSINE = 0; EUCLID = 1; aligns light_mlp hidden layers with booster deep
+    optional Similarity feature_distillation_function = 31 [default = COSINE];
+    // weight applied to per-tower logit hint (MSE) loss
+    optional float hint_loss_weight = 32 [default = 1.0];
+}

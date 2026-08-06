@@ -234,6 +234,23 @@ message AFPConfig {
     optional bool use_layer_norm = 3 [default = true];
 }
 
+// Soft variant of AFP (AFPModule2): a per-sample Gating-MLP produces a soft
+// partition weight; an entropy regulariser pushes it toward {0, 1}. Fully
+// differentiable (no STE). Drop-in alternative to AFPConfig.
+message AFPSoftConfig {
+    // partition granularity (reuses AFPConfig.AFPMode)
+    optional AFPConfig.AFPMode mode = 1 [default = FEATURE_WISE];
+    // hidden widths of the Gating-MLP that produces the partition logits;
+    // defaults to [64, 32] in code when empty
+    repeated uint32 gate_hidden_units = 2;
+    // fixed sigmoid temperature; smaller -> harder partition
+    optional float temperature = 3 [default = 1.0];
+    // weight on the binary-entropy regulariser (pushes p toward {0, 1})
+    optional float entropy_reg_weight = 4 [default = 0.05];
+    // apply LayerNorm to E before partitioning
+    optional bool use_layer_norm = 5 [default = true];
+}
+
 // APPNet Gate Neural Unit config (g = gamma * sigmoid(...)).
 message APPNetPPNetConfig {
     // hidden widths of each GateNU (cycled if fewer than DNN layers)
@@ -519,4 +536,163 @@ message MTL_APPNet_LHUC_CGC {
     repeated BiasTask bias_tasks = 13;
     // PCGrad loss fusion config
     optional PCGradConfig pcgrad = 14;
+}
+
+// DBMTL_LHUC_CGC: (dcnv2 || dnn) -> concat -> AFP(bit_wise) -> LHUC EP gate ->
+// AFP(bit_wise) -> LHUC PPNet -> stacked PLE/CGC extraction networks ->
+// DBMTL task towers (BayesTaskTower, relation_mlp supported).
+//
+// Each AFP produces two gradient-decoupled streams (S, O); the S stream of
+// afp1 feeds lhuc_gate as gate_input (replacing DBMTL_LHUC's manual
+// bias_feature_names), and the S stream of afp2 feeds lhuc_pp_net.
+message DBMTL_LHUC_CGC {
+    // shared bottom MaskNet module (applied to the raw embedding)
+    optional MaskNetModule mask_net = 1;
+    // optional DNN branch (applied to the raw embedding, parallel to dcnv2)
+    optional MLP bottom_mlp = 2;
+    // feature-cross DCNv2 branch (applied to the raw embedding)
+    required CrossV2 dcnv2 = 3;
+    // AFP before the LHUC EP gate (recommend BIT_WISE); runs on concat(dcnv2,dnn)
+    required AFPConfig afp1 = 4;
+    // shared LHUC EP gate; gate_input is afp1's S stream (no bias_feature_names)
+    required LHUCEPGateConfig lhuc_gate = 5;
+    // AFP before the LHUC PP net (recommend BIT_WISE); runs on the EP-gated rep
+    required AFPConfig afp2 = 6;
+    // shared LHUC PP net; gate_input is afp2's S stream
+    optional LHUCPPNetConfig lhuc_pp_net = 7;
+    // stacked PLE / CGC extraction networks
+    repeated ExtractionNetwork extraction_networks = 8;
+    // DBMTL task towers (BayesTaskTower with relation_mlp supported)
+    repeated BayesTaskTower task_towers = 9;
+    // sample weight fusion config
+    optional SampleWeightFusion sample_weight_fusion = 10;
+    // extensible bias auxiliary tasks
+    repeated BiasTask bias_tasks = 11;
+    // PCGrad loss fusion config
+    optional PCGradConfig pcgrad = 12;
+}
+
+// DBMTL_AFP_LHUC_CGC: variant of DBMTL_LHUC_CGC where the LHUC EP gate does
+// NOT use AFP -- it reads its gate_input from bias_feature_names (as in
+// DBMTL_LHUC) -- and only the LHUC PP net is preceded by a single AFP whose S
+// stream feeds the PP net.
+//
+// Flow: (dcnv2 || dnn) -> concat -> LHUC EP gate(bias_feature_names) ->
+// AFP(bit_wise) -> LHUC PPNet(gate_input = S) -> stacked PLE/CGC -> DBMTL towers.
+message DBMTL_AFP_LHUC_CGC {
+    // shared bottom MaskNet module (applied to the raw embedding)
+    optional MaskNetModule mask_net = 1;
+    // optional DNN branch (applied to the raw embedding, parallel to dcnv2)
+    optional MLP bottom_mlp = 2;
+    // feature-cross DCNv2 branch (applied to the raw embedding)
+    required CrossV2 dcnv2 = 3;
+    // shared LHUC EP gate; gate_input = bias_feature_names (no AFP before it)
+    required LHUCEPGateConfig lhuc_gate = 4;
+    // AFP variant placed before the LHUC PP net (recommend BIT_WISE); runs on
+    // the EP-gated concat representation. ``afp`` = paper STE hard partition
+    // (AFPModule); ``afp_soft`` = Gating-MLP soft partition (AFPModule2).
+    oneof afp_kind {
+        AFPConfig afp = 5;
+        AFPSoftConfig afp_soft = 12;
+    }
+    // shared LHUC PP net; gate_input is the AFP S stream
+    optional LHUCPPNetConfig lhuc_pp_net = 6;
+    // stacked PLE / CGC extraction networks
+    repeated ExtractionNetwork extraction_networks = 7;
+    // DBMTL task towers (BayesTaskTower with relation_mlp supported)
+    repeated BayesTaskTower task_towers = 8;
+    // sample weight fusion config
+    optional SampleWeightFusion sample_weight_fusion = 9;
+    // extensible bias auxiliary tasks
+    repeated BiasTask bias_tasks = 10;
+    // PCGrad loss fusion config
+    optional PCGradConfig pcgrad = 11;
+}
+
+// MMOE_LHUC task tower: LHUC acts as the MMoE task tower. Each tower drives its
+// LHUC EP/PP gate with an independent bias_feature_group, and the tower's MMoE
+// softmax gate weights are concatenated to that bias embedding as EP gate input.
+message MMOELHUCTaskTower {
+    // task name for the task tower
+    required string tower_name = 1;
+    // label for the task
+    required string label_name = 2;
+    // metrics for the task
+    repeated MetricConfig metrics = 3;
+    // log train metrics for task
+    repeated TrainMetricConfig train_metrics = 20;
+    // loss for the task
+    repeated LossConfig losses = 4;
+    // num_class for multi-class classification loss
+    optional uint32 num_class = 5 [default = 1];
+    // task specific mlp applied after the (optional) LHUC PP net
+    optional MLP mlp = 6;
+    // training loss weight
+    optional float weight = 7 [default = 1.0];
+    // sample weight for the task
+    optional string sample_weight_name = 8;
+    // label name for indicating the sample space for the task tower
+    optional string task_space_indicator_label = 9;
+    // the loss weight for sample in the task space
+    optional float in_task_space_weight = 10 [default = 1.0];
+    // the loss weight for sample out the task space
+    optional float out_task_space_weight = 11 [default = 1.0];
+    // feature_group name whose concatenated embeddings feed this tower's LHUC
+    // EP/PP gate. Declared as a top-level feature_groups entry (features may
+    // overlap with the main group; embeddings are shared). The MMoE per-task
+    // softmax gate weight vector is concatenated to this group's embedding to
+    // form the EP gate input. Each tower has its OWN bias_feature_group.
+    required string bias_feature_group = 12;
+    // Per-tower LHUC EP gate config (hidden_units; the bias_feature_names field
+    // of LHUCEPGateConfig is unused -- bias comes from bias_feature_group
+    // concatenated with the MMoE gate weights). Each tower has its OWN gate.
+    optional LHUCEPGateConfig lhuc_gate = 13;
+    // Per-tower LHUC PP net config (optional). Each tower has its OWN PP net.
+    optional LHUCPPNetConfig lhuc_pp_net = 14;
+    // Per-tower PP net gate_input source. Unset (default) = concat(bias, gate)
+    // (same as the EP gate); pp_afp / pp_afp_soft = this tower's own AFP
+    // partition of its EP-gated rep, with the O stream as the PP net input and
+    // the S stream as the PP net gate_input. Each tower has its OWN AFP.
+    oneof pp_gate_kind {
+        AFPConfig pp_afp = 15;
+        AFPSoftConfig pp_afp_soft = 16;
+    }
+}
+
+// MMOE_LHUC: (dcnv2 || dnn) -> concat -> single-level MMoE (N shared experts +
+// per-task softmax gate) -> per-task LHUC task tower (LHUCEPGate + LHUCPPNet).
+//
+// The per-task MMoE softmax gate weight vector is concatenated to each tower's
+// bias_feature_group embedding as that tower's LHUC EP gate input, so
+// personalization is aware of the expert-routing distribution. Each tower owns
+// its bias_feature_group, LHUC EP gate, LHUC PP net, and (optional) AFP
+// partition independently -- all configurable per tower.
+message MMOE_LHUC {
+    // shared bottom MaskNet module (applied to the raw embedding)
+    optional MaskNetModule mask_net = 1;
+    // optional DNN branch (applied to the raw embedding, parallel to dcnv2)
+    optional MLP bottom_mlp = 2;
+    // feature-cross DCNv2 branch (applied to the raw embedding)
+    required CrossV2 dcnv2 = 3;
+    // single-level MMoE shared expert MLP definition
+    required MLP expert_mlp = 4;
+    // optional MLP before the per-task softmax gate
+    optional MLP gate_mlp = 5;
+    // number of MMoE shared experts
+    required uint32 num_expert = 6 [default = 3];
+    // (Fields 7-10 were previously model-level lhuc_gate/lhuc_pp_net/pp_afp;
+    // they have moved to per-tower MMOELHUCTaskTower. Reserved to avoid
+    // accidental reuse with a different meaning.)
+    reserved 7, 8, 9, 10;
+    reserved "lhuc_gate", "lhuc_pp_net", "pp_afp", "pp_afp_soft";
+    // per-task LHUC task towers
+    repeated MMOELHUCTaskTower task_towers = 11;
+    // ESMM dependency (CTR/CVR CTCVR)
+    optional ESMMConfig esmm = 12;
+    // sample weight fusion config
+    optional SampleWeightFusion sample_weight_fusion = 13;
+    // extensible bias auxiliary tasks (predict bias fields as labels)
+    repeated BiasTask bias_tasks = 14;
+    // PCGrad loss fusion config
+    optional PCGradConfig pcgrad = 15;
 }

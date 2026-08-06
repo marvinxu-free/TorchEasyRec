@@ -89,6 +89,7 @@ message ModelConfig {
         RocketLaunching2 rocket_launching2 = 501;
         LHUCRocketLaunching lhuc_rocket_launching = 502;
         LHUCRocketLaunchingMT lhuc_rocket_launching_mt = 503;
+        MTLRocketLaunching mtl_rocket_launching = 504;
 
         // SID generation models
         // (600 is reserved for SidRqvae, arriving in the follow-up PR)
@@ -100,6 +101,9 @@ message ModelConfig {
         MTL_APPNet mtl_appnet = 211;
         MTL_APPNet_LHUC mtl_appnet_lhuc = 212;
         MTL_APPNet_LHUC_CGC mtl_appnet_lhuc_cgc = 213;
+        DBMTL_LHUC_CGC dbmtl_lhuc_cgc = 214;
+        DBMTL_AFP_LHUC_CGC dbmtl_afp_lhuc_cgc = 215;
+        MMOE_LHUC mmoe_lhuc = 216;
     }
 
     optional uint32 num_class = 2 [default = 1];
