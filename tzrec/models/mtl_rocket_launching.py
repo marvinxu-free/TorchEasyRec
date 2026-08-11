@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
@@ -24,15 +25,52 @@ from tzrec.modules.interaction import CrossV2
 from tzrec.modules.mlp import MLP
 from tzrec.modules.utils import div_no_nan
 from tzrec.protos.model_pb2 import ModelConfig
+from tzrec.protos.models import general_rank_model_pb2
 from tzrec.protos.simi_pb2 import Similarity
 from tzrec.utils.config_util import config_to_kwargs
+
+
+class HintLoss(nn.Module):
+    """Per-tower logit hint distillation loss.
+
+    Selectable per tower via ``hint_loss_type``:
+
+    - ``HINT_MSE`` (default, back-compat): ``MSE(light_logit, booster_logit)``.
+    - ``HINT_BCE``: binary cross-entropy with logits where ``sigmoid(booster
+      logit)`` (the booster's predicted probability, in [0, 1]) is the soft
+      target and ``light_logit`` is the prediction -- the distillation
+      analogue of a binary task loss, so the hint gradient shares the task
+      loss landscape for 0/1 labels.
+
+    The booster side is detached here (the hint supervises the light branch
+    only); this is idempotent with the caller-side detach in
+    ``_distillation_losses``.
+    """
+
+    def __init__(self, kind: int, reduction: str = "mean") -> None:
+        super().__init__()
+        self.kind = kind
+        self.reduction = reduction
+
+    def forward(
+        self, light_logit: torch.Tensor, booster_logit: torch.Tensor
+    ) -> torch.Tensor:
+        if self.kind == general_rank_model_pb2.HintLossType.HINT_BCE:
+            soft_target = torch.sigmoid(booster_logit.detach())
+            return F.binary_cross_entropy_with_logits(
+                light_logit, soft_target, reduction=self.reduction
+            )
+        return F.mse_loss(
+            light_logit, booster_logit.detach(), reduction=self.reduction
+        )
 
 
 class MTLRocketLaunching(MultiTaskRank):
     """Multi-task RocketLaunching model.
 
-    Booster (teacher, training only): ``share -> cross -> deep -> ple`` serial
-    trunk, followed by **parallel** per-task towers (e.g. ctr_tower + cvr_tower).
+    Booster (teacher, training only): ``share -> [cross, deep] (parallel, each
+    with its own LayerNorm, concatenated) -> ple`` trunk, followed by
+    **parallel** per-task towers (e.g. ctr_tower + cvr_tower).
     Light (student, training + inference): ``share.detach() -> light_mlp ->
     per-tower heads``. Only light is served online; the heavy cross/deep/PLE
     trunk runs during training to distill into light.
@@ -64,7 +102,46 @@ class MTLRocketLaunching(MultiTaskRank):
 
         self._task_nums = len(self._task_tower_cfgs)
         self._feature_based_distillation = self._model_config.feature_based_distillation
-        self._hint_loss_weight = self._model_config.hint_loss_weight
+        self._hint_loss_weight = self._model_config.hint_loss_weight  # model-level fallback
+
+        # Per-task resolved distillation weights. A tower listed in
+        # task_distill_weights overrides the model-level value for each field it
+        # actually sets (HasField); otherwise the model-level value is used. With
+        # no task_distill_weights, behavior is unchanged (hint=1.0, feature
+        # similarity=-0.1 == the old hardcoded literal).
+        _overrides = {
+            w.tower_name: w for w in self._model_config.task_distill_weights
+        }
+        self._hint_loss_weights: Dict[str, float] = {}
+        self._feature_distillation_weights: Dict[str, float] = {}
+        self._hint_loss_types: Dict[str, int] = {}
+        _known_towers = {c.tower_name for c in self._task_tower_cfgs}
+        for _tower_cfg in self._task_tower_cfgs:
+            _tname = _tower_cfg.tower_name
+            _ov = _overrides.get(_tname)
+            self._hint_loss_weights[_tname] = (
+                _ov.hint_loss_weight
+                if _ov is not None and _ov.HasField("hint_loss_weight")
+                else self._model_config.hint_loss_weight
+            )
+            self._feature_distillation_weights[_tname] = (
+                _ov.feature_distillation_weight
+                if _ov is not None
+                and _ov.HasField("feature_distillation_weight")
+                else self._model_config.feature_distillation_weight
+            )
+            self._hint_loss_types[_tname] = (
+                _ov.hint_loss_type
+                if _ov is not None and _ov.HasField("hint_loss_type")
+                else self._model_config.hint_loss_type
+            )
+        for _w in self._model_config.task_distill_weights:
+            if _w.tower_name not in _known_towers:
+                logging.warning(
+                    "task_distill_weights tower_name %s not found in task_towers,"
+                    " this override has no effect.",
+                    _w.tower_name,
+                )
 
         self.init_input()
         self.group_name = self.embedding_group.group_names()[0]
@@ -78,8 +155,10 @@ class MTLRocketLaunching(MultiTaskRank):
             )
         share_dim = self.share_mlp.output_dim() if self.share_mlp else feature_in
 
-        # ===== Booster trunk (all stages OPTIONAL, applied in order:
-        # cross -> deep -> ple). Any subset may be configured. =====
+        # ===== Booster trunk (cross & deep run in PARALLEL from share, each
+        # with its own LayerNorm; outputs are concatenated -> ple). Either
+        # branch is optional; with neither, trunk = share. This mirrors the
+        # LHUCRocketLaunchingMT booster and the DCN-V2 parallel structure. =====
         self.booster_cross = None
         self.booster_cross_ln = None
         if self._model_config.HasField("cross"):
@@ -91,24 +170,21 @@ class MTLRocketLaunching(MultiTaskRank):
         self.booster_deep = None
         self.booster_deep_ln = None
         if self._model_config.HasField("deep"):
-            deep_in = (
-                self.booster_cross.output_dim()
-                if self.booster_cross is not None
-                else share_dim
-            )
+            # parallel: deep reads share directly (not chained after cross)
             self.booster_deep = MLP(
-                in_features=deep_in,
+                in_features=share_dim,
                 **config_to_kwargs(self._model_config.deep),
             )
             self.booster_deep_ln = nn.LayerNorm(self.booster_deep.output_dim())
 
-        # trunk output dim = last present stage's dim (cross preserves dim, deep
-        # sets it); falls back to share_dim if neither cross nor deep is set.
+        # trunk output dim = sum of present parallel branches (concatenated);
+        # falls back to share_dim if neither cross nor deep is set.
+        trunk_dim = 0
+        if self.booster_cross is not None:
+            trunk_dim += self.booster_cross.output_dim()
         if self.booster_deep is not None:
-            trunk_dim = self.booster_deep.output_dim()
-        elif self.booster_cross is not None:
-            trunk_dim = self.booster_cross.output_dim()
-        else:
+            trunk_dim += self.booster_deep.output_dim()
+        if trunk_dim == 0:
             trunk_dim = share_dim
 
         # ===== Booster: stacked PLE / CGC extraction networks (optional) =====
@@ -279,18 +355,34 @@ class MTLRocketLaunching(MultiTaskRank):
         # ---- Light branch (training + inference) ----
         light_logits, light_hidden = self._light_forward(share.detach())
         predictions = self._tower_outputs_to_predictions(light_logits, "_light")
-        if self._feature_based_distillation:
+        # Distillation hidden features are only consumed by the training-time
+        # feature-similarity loss (_distillation_losses); skip them in eval so
+        # they don't leak into the served (light-only) model outputs.
+        if self.training and self._feature_based_distillation:
             for tower_name, layers in light_hidden.items():
                 for i, feat in layers.items():
                     predictions[f"light_{tower_name}_{i}"] = feat
 
         # ---- Booster branch (training only) ----
         if self.training:
-            trunk = share
+            # cross & deep run in parallel from share, each with its own LN;
+            # outputs are concatenated. Single-branch -> that branch's output;
+            # no branch -> share (preserves the optional-subset semantics).
+            parallel_outputs: List[torch.Tensor] = []
             if self.booster_cross is not None:
-                trunk = self.booster_cross_ln(self.booster_cross(trunk))
+                parallel_outputs.append(
+                    self.booster_cross_ln(self.booster_cross(share))
+                )
             if self.booster_deep is not None:
-                trunk = self.booster_deep_ln(self.booster_deep(trunk))
+                parallel_outputs.append(
+                    self.booster_deep_ln(self.booster_deep(share))
+                )
+            if len(parallel_outputs) > 1:
+                trunk = torch.cat(parallel_outputs, dim=-1)
+            elif len(parallel_outputs) == 1:
+                trunk = parallel_outputs[0]
+            else:
+                trunk = share
 
             # PLE/CGC routing (optional). Without it every task tower reads the
             # same shared trunk directly (no per-task replication).
@@ -334,8 +426,16 @@ class MTLRocketLaunching(MultiTaskRank):
         light_feature: torch.Tensor,
         booster_feature: torch.Tensor,
         loss_weight: Optional[torch.Tensor],
+        distill_weight: float = -0.1,
     ) -> torch.Tensor:
-        """Cosine / Euclid similarity between matched per-tower hidden layers."""
+        """Cosine / Euclid similarity between matched per-tower hidden layers.
+
+        distill_weight scales the COSINE branch only (sign convention: negative
+        minimizes by aligning light<->booster; default -0.1 preserves the
+        previous hardcoded behavior). The EUCLID branch is intentionally NOT
+        scaled: it returns a positive distance already minimized by alignment,
+        so applying the (negative) cosine weight would invert its gradient.
+        """
         feature_distillation_function = self._model_config.feature_distillation_function
         booster_feature_no_gradient = booster_feature.detach()
         if feature_distillation_function == Similarity.COSINE:
@@ -343,11 +443,13 @@ class MTLRocketLaunching(MultiTaskRank):
             light_norm = F.normalize(light_feature, p=2, dim=1)
             multi_middle_layer = torch.mul(booster_norm, light_norm)
             if loss_weight is not None:
-                sim = -0.1 * torch.mean(
+                sim = distill_weight * torch.mean(
                     torch.sum(multi_middle_layer, dim=1) * loss_weight
                 )
             else:
-                sim = -0.1 * torch.mean(torch.sum(multi_middle_layer, dim=1))
+                sim = distill_weight * torch.mean(
+                    torch.sum(multi_middle_layer, dim=1)
+                )
             return sim
         else:
             distance_square = torch.square(booster_feature_no_gradient - light_feature)
@@ -374,7 +476,9 @@ class MTLRocketLaunching(MultiTaskRank):
                     reduction=reduction,
                     suffix=f"_{tower_name}_booster",
                 )
-            self.hint_loss_modules[tower_name] = nn.MSELoss(reduction=reduction)
+            self.hint_loss_modules[tower_name] = HintLoss(
+                kind=self._hint_loss_types[tower_name], reduction=reduction
+            )
 
     def _compute_loss_weight(
         self, task_tower_cfg, batch: Batch
@@ -418,13 +522,16 @@ class MTLRocketLaunching(MultiTaskRank):
                 hint = torch.mean(batch_hint * lw)
             else:
                 hint = batch_hint
-            losses[f"hint_l2_loss_{tower_name}"] = hint * self._hint_loss_weight
+            losses[f"hint_l2_loss_{tower_name}"] = (
+                hint * self._hint_loss_weights[tower_name]
+            )
             # feature distillation on matched per-tower hidden layers
+            _sim_w = self._feature_distillation_weights[tower_name]
             for i, j in self._distill_index.get(tower_name, {}).items():
                 light_feat = predictions[f"light_{tower_name}_{i}"]
                 booster_feat = predictions[f"booster_{tower_name}_{j}"]
                 losses[f"sim_{tower_name}_{i}_{j}"] = self.feature_based_sim(
-                    light_feat, booster_feat, None
+                    light_feat, booster_feat, None, distill_weight=_sim_w
                 )
         return losses
 

@@ -129,6 +129,30 @@ message LHUCRocketLaunchingMT {
     optional AGEExplorationConfig age_exploration = 40;
 }
 
+// Per-tower logit hint distillation loss type.
+enum HintLossType {
+    // L2 (MSE) between light and booster logits (legacy default).
+    HINT_MSE = 0;
+    // Binary cross-entropy with logits: sigmoid(booster logit) as soft
+    // target, light logit as prediction. Use for binary tasks so the hint
+    // gradient matches the task-loss (BCE) landscape.
+    HINT_BCE = 1;
+}
+
+// MTLRocketLaunching per-task distillation weight override; matched to
+// task_towers by tower_name. A field left unset falls back to the corresponding
+// model-level value on MTLRocketLaunching.
+message TaskDistillWeight {
+    // tower_name this override applies to (must match a task_towers entry)
+    required string tower_name = 1;
+    // overrides MTLRocketLaunching.hint_loss_weight for this tower
+    optional float hint_loss_weight = 2;
+    // overrides MTLRocketLaunching.feature_distillation_weight (COSINE branch)
+    optional float feature_distillation_weight = 3;
+    // overrides MTLRocketLaunching.hint_loss_type for this tower
+    optional HintLossType hint_loss_type = 4;
+}
+
 message MTLRocketLaunching {
     // ===== Shared bottom (booster & light; light uses detached output so
     // share_mlp gradients flow only from the booster) =====
@@ -161,4 +185,13 @@ message MTLRocketLaunching {
     optional Similarity feature_distillation_function = 31 [default = COSINE];
     // weight applied to per-tower logit hint (MSE) loss
     optional float hint_loss_weight = 32 [default = 1.0];
+    // global feature-based similarity (COSINE) distillation weight; per-tower
+    // overrides via task_distill_weights take precedence. Default -0.1 preserves
+    // the previous hardcoded behavior.
+    optional float feature_distillation_weight = 33 [default = -0.1];
+    // per-task distillation weight overrides, matched to task_towers by tower_name
+    repeated TaskDistillWeight task_distill_weights = 34;
+    // global per-tower logit hint loss type (HINT_MSE default for back-compat);
+    // per-tower override via task_distill_weights.hint_loss_type
+    optional HintLossType hint_loss_type = 35 [default = HINT_MSE];
 }
