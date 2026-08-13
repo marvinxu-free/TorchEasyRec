@@ -195,3 +195,43 @@ message MTLRocketLaunching {
     // per-tower override via task_distill_weights.hint_loss_type
     optional HintLossType hint_loss_type = 35 [default = HINT_MSE];
 }
+
+// MTLRocketLaunching2: variant of MTLRocketLaunching that (1) drops the PLE/CGC
+// extraction networks (all task towers read the same cross/deep parallel
+// trunk) and (2) supports per-tower input detach so a tower's direct
+// supervision does not update the shared bottom (share/cross/deep/light_mlp).
+// Typical use: CTR tower updates the bottom normally, CVR tower is detached and
+// (via task_space_indicator_label) only learns on clicked samples.
+message MTLRocketLaunching2 {
+    // ===== Shared bottom (booster & light; light uses detached output) =====
+    optional MLP share_mlp = 1;
+
+    // ===== Booster trunk: cross & deep run in PARALLEL from share, each with
+    // its own LayerNorm; outputs are concatenated -> task towers (NO PLE). =====
+    optional CrossV2 cross = 2;
+    optional MLP deep = 3;
+    // parallel multi-task towers, shared by booster and light
+    repeated TaskTower task_towers = 5;
+
+    // ===== Light (student, training + inference): share.detach() -> light_mlp
+    // -> per-tower heads. Only light is served online. =====
+    required MLP light_mlp = 20;
+    optional MLP light_task_mlp = 21;
+
+    // ===== Distillation (same fields/defaults as MTLRocketLaunching) =====
+    optional bool feature_based_distillation = 30 [default = false];
+    // COSINE = 0; EUCLID = 1;
+    optional Similarity feature_distillation_function = 31 [default = COSINE];
+    // weight applied to per-tower logit hint loss
+    optional float hint_loss_weight = 32 [default = 1.0];
+    optional float feature_distillation_weight = 33 [default = -0.1];
+    repeated TaskDistillWeight task_distill_weights = 34;
+    optional HintLossType hint_loss_type = 35 [default = HINT_MSE];
+
+    // Towers whose input is detached from the trunk (booster) / light_rep
+    // (light), so their direct supervision (task loss + distillation hint)
+    // does NOT update share/cross/deep/light_mlp. The tower's own task mlp +
+    // linear still learn. Typically the CVR tower; the CTR tower keeps
+    // updating the bottom normally.
+    repeated string detached_tower_names = 36;
+}
