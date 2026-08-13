@@ -235,3 +235,64 @@ message MTLRocketLaunching2 {
     // updating the bottom normally.
     repeated string detached_tower_names = 36;
 }
+
+// ====================================================================
+// SDCL Rocket Launching (sdcl_rocket_launching)
+// ANSL (Adaptive Negative Sample Learning) on the light (pre-ranking) net.
+// No detach (joint training, shared bottom). Logit BCE distillation (Eq.5).
+// Ref: SDCL (AAAI 2025).
+// ====================================================================
+
+// Negative Sample Gate Unit (Eq.6): g = x ⊙ Gate(x),
+// Gate(x) = alpha * Sigmoid(Linear2(ReLU(Linear1(x)))).
+message NSGate {
+    // bottleneck dim; if unset, resolved to input_dim // 4 at build time.
+    optional uint32 hidden_units = 1;
+    // scale alpha; Gate ∈ [0, alpha]. PEPNet-style default 2.0.
+    optional float alpha = 2 [default = 2.0];
+}
+
+// Per-task Weighted Contrastive Loss config. A tower gets WCL only if listed
+// in SDCLRocketLaunching.task_wcl_weights (opt-in).
+message TaskWCLWeight {
+    required string tower_name = 1;
+    // master switch (set false to disable a listed tower).
+    optional bool enable = 2 [default = true];
+    // per-task β_w (overrides model-level wcl_weight).
+    optional float weight = 3;
+    // # negatives sampled per task per batch (N).
+    optional uint32 num_negatives = 4;
+    // temperature τ.
+    optional float temperature = 5;
+    // scale δ for adaptive weight.
+    optional float delta = 6;
+}
+
+message SDCLRocketLaunching {
+    // ===== Shared bottom (booster & light, jointly trained; NO detach) =====
+    optional MLP share_mlp = 1;
+
+    // ===== Booster trunk (ranking net, training only) — same as v2 =====
+    optional CrossV2 cross = 2;
+    optional MLP deep = 3;
+    repeated TaskTower task_towers = 5;
+
+    // ===== Light (pre-ranking net, training + inference) =====
+    required MLP light_mlp = 20;
+    optional MLP light_task_mlp = 21;
+    // Negative Sample Gate Unit on the light input (Eq.6). If unset, no gate.
+    optional NSGate ns_gate = 37;
+
+    // ===== Distillation (logit BCE = Eq.5; NO feature_based_sim) =====
+    optional float hint_loss_weight = 32 [default = 1.0];
+    repeated TaskDistillWeight task_distill_weights = 34;
+    optional HintLossType hint_loss_type = 35 [default = HINT_BCE];
+
+    // ===== Weighted Contrastive Loss (Eq.7+8), light only =====
+    optional float wcl_weight = 38 [default = 0.1];
+    optional uint32 wcl_num_negatives = 39 [default = 8];
+    optional float wcl_temperature = 40 [default = 0.1];
+    optional float wcl_delta = 41 [default = 1.0];
+    // opt-in per-task WCL config (a tower gets WCL only if listed here).
+    repeated TaskWCLWeight task_wcl_weights = 42;
+}

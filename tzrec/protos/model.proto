@@ -91,6 +91,7 @@ message ModelConfig {
         LHUCRocketLaunchingMT lhuc_rocket_launching_mt = 503;
         MTLRocketLaunching mtl_rocket_launching = 504;
         MTLRocketLaunching2 mtl_rocket_launching2 = 505;
+        SDCLRocketLaunching sdcl_rocket_launching = 506;
 
         // SID generation models
         // (600 is reserved for SidRqvae, arriving in the follow-up PR)
