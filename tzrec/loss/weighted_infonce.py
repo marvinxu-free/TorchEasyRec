@@ -14,6 +14,29 @@ import torch
 from torch import nn
 
 
+def weighted_infonce_loss(
+    pos_logits: torch.Tensor,    # [P]
+    neg_logits: torch.Tensor,    # [P, N]
+    neg_weights: torch.Tensor,   # [P, N], strictly > 0
+    temperature: float,
+) -> torch.Tensor:
+    """Stable Weighted InfoNCE (SDCL Eq.7). Single source of truth.
+
+    For the math see :class:`WeightedInfoNCELoss`. Exposed as a free function
+    so callers that need ``torch.fx``-opaque execution can reuse the exact same
+    loss math without a Module -- e.g. the SDCL model's WCL path, whose in-batch
+    sampling is data-dependent (``.item()`` / ``nonzero`` / ``randint``) and is
+    run behind a ``@torch.fx.wrap`` leaf so TorchRec's symbolic trace skips it.
+    """
+    p = pos_logits / temperature                              # [P]
+    n = neg_logits / temperature                              # [P, N]
+    # log(w · exp(n)) = n + log(w); concat with p column and logsumexp.
+    neg_term = n + torch.log(neg_weights)                     # [P, N]
+    logits = torch.cat([p.unsqueeze(1), neg_term], dim=1)     # [P, 1 + N]
+    loss = -p + torch.logsumexp(logits, dim=1)                # [P]
+    return loss.mean()
+
+
 class WeightedInfoNCELoss(nn.Module):
     """Weighted InfoNCE (SDCL Eq.7) with per-negative adaptive weights.
 
@@ -46,10 +69,6 @@ class WeightedInfoNCELoss(nn.Module):
         neg_logits: torch.Tensor,   # [P, N]
         neg_weights: torch.Tensor,  # [P, N], strictly > 0
     ) -> torch.Tensor:
-        p = pos_logits / self.temperature                       # [P]
-        n = neg_logits / self.temperature                       # [P, N]
-        # log(w · exp(n)) = n + log(w); concat with p column and logsumexp.
-        neg_term = n + torch.log(neg_weights)                   # [P, N]
-        logits = torch.cat([p.unsqueeze(1), neg_term], dim=1)   # [P, 1 + N]
-        loss = -p + torch.logsumexp(logits, dim=1)              # [P]
-        return loss.mean()
+        return weighted_infonce_loss(
+            pos_logits, neg_logits, neg_weights, self.temperature
+        )

@@ -20,7 +20,7 @@ from torch import nn
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
-from tzrec.loss.weighted_infonce import WeightedInfoNCELoss
+from tzrec.loss.weighted_infonce import weighted_infonce_loss
 from tzrec.models.mtl_rocket_launching2 import MTLRocketLaunching2
 from tzrec.models.multi_task_rank import MultiTaskRank
 from tzrec.modules.interaction import CrossV2
@@ -28,6 +28,61 @@ from tzrec.modules.mlp import MLP
 from tzrec.modules.ns_gate import NSGate
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.utils.config_util import config_to_kwargs
+
+
+@torch.fx.wrap
+def _wcl_for_task(
+    light_rep: torch.Tensor,   # [B, d]  (already L2-normalized by the caller)
+    logits: torch.Tensor,      # [B]
+    label: torch.Tensor,       # [B], float (1 positive, 0 negative)
+    num_negatives: int,
+    temperature: float,
+    delta: float,
+) -> torch.Tensor:
+    """In-batch weighted contrastive loss for one task (SDCL Eq.7 + Eq.8).
+
+    ``@torch.fx.wrap`` makes this an opaque leaf for ``torch.fx`` symbolic
+    tracing (used by TorchRec's train pipeline, which traces the full
+    ``TrainWrapper.forward`` including ``loss()``). The body relies on
+    data-dependent control flow -- ``.item()`` / ``torch.nonzero`` /
+    ``torch.randint`` with a data-dependent upper bound -- that FX cannot
+    trace. Wrapping lets the tracer record a single ``call_function`` node and
+    skip the body, which then runs only at eager (training) time. Same pattern
+    as ``tzrec/loss/jrc_loss.py`` and ``tzrec/models/dat.py``.
+
+    Semantics: in-batch positives are ``label == 1``, the negative pool is
+    ``label == 0``; ``num_negatives`` are sampled (shared across positives).
+    The adaptive negative weight (Eq.8) is
+    ``δ · (softmax_z(cos(rep_pos, rep_neg)) + sigmoid(neg_logit_z))``. The Eq.7
+    InfoNCE math reuses :func:`weighted_infonce_loss` (single source of truth).
+
+    Returns a 0-dim loss tensor (``0`` when the batch has no positive or no
+    negative for this task, so the term contributes nothing downstream).
+    """
+    pos_mask = label > 0
+    neg_mask = label == 0
+    n_pos = int(pos_mask.sum().item())
+    n_neg_pool = int(neg_mask.sum().item())
+    if n_pos == 0 or n_neg_pool == 0:
+        return torch.zeros((), dtype=logits.dtype, device=logits.device)
+    _n = min(num_negatives, n_neg_pool)
+    pos_idx = torch.nonzero(pos_mask, as_tuple=False).squeeze(-1)
+    neg_pool_idx = torch.nonzero(neg_mask, as_tuple=False).squeeze(-1)
+    neg_sample_idx = neg_pool_idx[
+        torch.randint(0, n_neg_pool, (_n,), device=logits.device)
+    ]
+
+    pos_logits = logits[pos_idx]               # [P]
+    pos_rep = light_rep[pos_idx]               # [P, d]
+    neg_logits_pool = logits[neg_sample_idx]   # [N]
+    neg_rep = light_rep[neg_sample_idx]        # [N, d]
+
+    sim = pos_rep @ neg_rep.t()                # [P, N] cosine (rep normalized)
+    softmax_sim = torch.softmax(sim, dim=1)    # [P, N]
+    diff_term = torch.sigmoid(neg_logits_pool)  # [N]
+    w = delta * (softmax_sim + diff_term.unsqueeze(0).expand(n_pos, _n))  # [P,N]
+    neg_logits = neg_logits_pool.unsqueeze(0).expand(n_pos, _n)           # [P,N]
+    return weighted_infonce_loss(pos_logits, neg_logits, w, temperature)
 
 
 class SDCLRocketLaunching(MTLRocketLaunching2):
@@ -315,13 +370,14 @@ class SDCLRocketLaunching(MTLRocketLaunching2):
         return predictions
 
     def init_loss(self) -> None:
-        """Initialize loss modules: BCE task losses + HintLoss + WCL modules."""
+        """Initialize loss modules: BCE task losses + HintLoss (inherited).
+
+        WCL adds no learnable parameters -- the Eq.7 InfoNCE math is a pure
+        function (:func:`weighted_infonce_loss`) called from the
+        ``@torch.fx.wrap`` leaf :func:`_wcl_for_task`, so nothing to
+        instantiate here beyond the inherited BCE + HintLoss modules.
+        """
         super().init_loss()  # MTLRocketLaunching.init_loss: BCE + hint modules
-        self.wcl_modules = nn.ModuleDict()
-        for _tname, _cfg in self._wcl_cfgs.items():
-            self.wcl_modules[_tname] = WeightedInfoNCELoss(
-                temperature=_cfg["temperature"]
-            )
 
     def _distillation_losses(
         self,
@@ -362,39 +418,23 @@ class SDCLRocketLaunching(MTLRocketLaunching2):
             return losses
         rep = F.normalize(predictions["light_rep"], p=2, dim=1)
         for _tname, _cfg in self._wcl_cfgs.items():
-            label = batch.labels[self._label_by_tower[_tname]].to(
-                torch.float32
-            ).reshape(-1)
-            logits = predictions[f"logits_{_tname}_light"].reshape(-1)
-            pos_mask = label > 0
-            neg_mask = label == 0
-            n_pos = int(pos_mask.sum().item())
-            n_neg_pool = int(neg_mask.sum().item())
-            if n_pos == 0 or n_neg_pool == 0:
-                continue
-            _N = min(int(_cfg["num_negatives"]), n_neg_pool)
-            pos_idx = torch.nonzero(pos_mask, as_tuple=False).squeeze(-1)
-            neg_pool_idx = torch.nonzero(neg_mask, as_tuple=False).squeeze(-1)
-            neg_sample_idx = neg_pool_idx[
-                torch.randint(0, n_neg_pool, (_N,), device=logits.device)
-            ]
-
-            pos_logits = logits[pos_idx]                  # [P]
-            pos_rep = rep[pos_idx]                        # [P, d]
-            neg_logits_pool = logits[neg_sample_idx]      # [N]
-            neg_rep = rep[neg_sample_idx]                 # [N, d]
-
-            sim = pos_rep @ neg_rep.t()                   # [P, N] cosine
-            softmax_sim = torch.softmax(sim, dim=1)       # [P, N]
-            diff_term = torch.sigmoid(neg_logits_pool)    # [N]
-            w = _cfg["delta"] * (
-                softmax_sim
-                + diff_term.unsqueeze(0).expand(n_pos, _N)
+            label = (
+                batch.labels[self._label_by_tower[_tname]]
+                .to(torch.float32)
+                .reshape(-1)
             )
-            neg_logits = neg_logits_pool.unsqueeze(0).expand(
-                n_pos, _N
-            )  # [P, N]
-            wcl = self.wcl_modules[_tname](pos_logits, neg_logits, w)
+            logits = predictions[f"logits_{_tname}_light"].reshape(-1)
+            # The data-dependent sampling + Eq.8 weighting lives behind the
+            # @torch.fx.wrap leaf _wcl_for_task so this loss() path stays
+            # torch.fx-traceable for TorchRec's train pipeline.
+            wcl = _wcl_for_task(
+                rep,
+                logits,
+                label,
+                int(_cfg["num_negatives"]),
+                _cfg["temperature"],
+                _cfg["delta"],
+            )
             losses[f"weighted_infonce_{_tname}_light"] = wcl * _cfg["weight"]
         return losses
 
