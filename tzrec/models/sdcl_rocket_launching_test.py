@@ -161,6 +161,8 @@ class SDCLRocketLaunchingTest(unittest.TestCase):
         init_parameters(model, device=torch.device("cpu"))
         if not is_training:
             model.eval()
+        # Eq.8 similarity runs on the input feature vectors (embedding concat).
+        expected_fea_dim = model.embedding_group.group_total_dim(model.group_name)
         model = create_test_model(model, graph_type)
 
         batch = _batch()
@@ -175,14 +177,14 @@ class SDCLRocketLaunchingTest(unittest.TestCase):
         if not is_training:
             for tower in ["is_click", "is_conversion"]:
                 self.assertTrue(f"logits_{tower}_booster" not in predictions)
-            # light_rep is training-only; absent in eval.
-            self.assertTrue("light_rep" not in predictions)
+            # wcl_input_fea is training-only; absent in eval.
+            self.assertTrue("wcl_input_fea" not in predictions)
         else:
             for tower in ["is_click", "is_conversion"]:
                 self.assertEqual(
                     predictions[f"logits_{tower}_booster"].size(), (2,)
                 )
-            self.assertEqual(predictions["light_rep"].size(), (2, 16))
+            self.assertEqual(predictions["wcl_input_fea"].size(), (2, expected_fea_dim))
 
         # loss path on eager model only (repo convention)
         if graph_type == TestGraphType.NORMAL and is_training:
@@ -267,7 +269,8 @@ class SDCLRocketLaunchingTest(unittest.TestCase):
         # backward through the full loss (rank + distill + wcl) must succeed.
         total = torch.stack(list(losses.values())).sum()
         total.backward()
-        # WCL reached light_rep / ns_gate / share_mlp (no detach).
+        # WCL gradients reach the light path (logit terms -> ns_gate /
+        # share_mlp) and the input embeddings (Eq.8 sim term); no detach.
         self.assertIsNotNone(model.ns_gate.linear2.weight.grad)
         self.assertIsNotNone(model.share_mlp.mlp[0].perceptron[0].weight.grad)
 

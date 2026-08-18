@@ -32,7 +32,8 @@ from tzrec.utils.config_util import config_to_kwargs
 
 @torch.fx.wrap
 def _wcl_for_task(
-    light_rep: torch.Tensor,   # [B, d]  (already L2-normalized by the caller)
+    input_fea: torch.Tensor,   # [B, d]  input feature vectors x (embedding
+                               # concat, pre share_mlp; L2-normalized by caller)
     logits: torch.Tensor,      # [B]
     label: torch.Tensor,       # [B], float (1 positive, 0 negative)
     num_negatives: int,
@@ -52,19 +53,32 @@ def _wcl_for_task(
 
     Semantics: in-batch positives are ``label == 1``, the negative pool is
     ``label == 0``; ``num_negatives`` are sampled (shared across positives).
-    The adaptive negative weight (Eq.8) is
-    ``δ · (softmax_z(cos(rep_pos, rep_neg)) + sigmoid(neg_logit_z))``. The Eq.7
+    The Eq.8 similarity runs on the INPUT feature vectors ``x`` (paper
+    notation ``sim(x_i, x_z)``: cosine on the L2-normalized embedding
+    concat), NOT on the learned light representation. The adaptive negative
+    weight (Eq.8) is
+    ``δ · (softmax_z(cos(x_i, x_z)) + sigmoid(neg_logit_z))``. The Eq.7
     InfoNCE math reuses :func:`weighted_infonce_loss` (single source of truth).
 
     Returns a 0-dim loss tensor (``0`` when the batch has no positive or no
     negative for this task, so the term contributes nothing downstream).
     """
+    # ========== 第 0 步：in-batch 按标签划分正负样本 ==========
+    # 正样本 = 本 task label==1 的样本；负样本池 = label==0 的样本。
+    # （负样本来自同一个 batch，不引入额外采样数据源。）
     pos_mask = label > 0
     neg_mask = label == 0
     n_pos = int(pos_mask.sum().item())
     n_neg_pool = int(neg_mask.sum().item())
+    # batch 内没有正样本或没有负样本时，WCL 无法构成对比对，返回 0
+    # （该 task 的 WCL 项对本 batch 贡献为 0，不影响其他 loss 项）。
     if n_pos == 0 or n_neg_pool == 0:
         return torch.zeros((), dtype=logits.dtype, device=logits.device)
+
+    # ========== 第 1 步：从负样本池中随机抽 N 个负样本 ==========
+    # N = min(num_negatives, 池大小)。抽出的这 N 个负样本被所有 P 个正样本
+    # 共享（即论文中每个正样本 i 对同一组负样本 {z} 做对比）。
+    # 注意：torch.randint 是有放回采样。
     _n = min(num_negatives, n_neg_pool)
     pos_idx = torch.nonzero(pos_mask, as_tuple=False).squeeze(-1)
     neg_pool_idx = torch.nonzero(neg_mask, as_tuple=False).squeeze(-1)
@@ -72,15 +86,34 @@ def _wcl_for_task(
         torch.randint(0, n_neg_pool, (_n,), device=logits.device)
     ]
 
+    # ========== 第 2 步：取出正/负样本的 logit 和输入特征向量 ==========
+    # logits 是 light 塔本 task 的原始输出（score，未经 sigmoid）；
+    # input_fea 是进模型前的特征向量（embedding concat，论文 Eq.8 的 x），
+    # 已由调用方 L2 归一化，点积即余弦相似度。
     pos_logits = logits[pos_idx]               # [P]
-    pos_rep = light_rep[pos_idx]               # [P, d]
+    pos_fea = input_fea[pos_idx]               # [P, d]
     neg_logits_pool = logits[neg_sample_idx]   # [N]
-    neg_rep = light_rep[neg_sample_idx]        # [N, d]
+    neg_fea = input_fea[neg_sample_idx]        # [N, d]
 
-    sim = pos_rep @ neg_rep.t()                # [P, N] cosine (rep normalized)
-    softmax_sim = torch.softmax(sim, dim=1)    # [P, N]
+    # ========== 第 3 步：Eq.8 自适应负样本权重 w_iz ==========
+    # w_iz = δ · ( softmax_z( cos(x_i, x_z) ) + sigmoid(n_iz) )
+    #   第一项（内容相似度，定义在输入特征向量 x 上）：对正样本 i，在 N 个
+    #     负样本上做 softmax —— 与正样本输入特征越相似的负样本
+    #     （内容空间里的难负例）权重越大；
+    #   第二项（打分难度）：负样本的 light 预测分过 sigmoid ——
+    #     模型当前打分越高的负样本（打分空间的难负例）权重越大；
+    #   δ 为整体缩放系数。
+    # 注意：w 没有 detach，梯度会同时流经 sim 和 neg_logits（见 review 说明）。
+    sim = pos_fea @ neg_fea.t()                # [P, N] cosine (fea normalized)
+    softmax_sim = torch.softmax(sim, dim=1)    # [P, N] softmax over N negatives
     diff_term = torch.sigmoid(neg_logits_pool)  # [N]
     w = delta * (softmax_sim + diff_term.unsqueeze(0).expand(n_pos, _n))  # [P,N]
+
+    # ========== 第 4 步：Eq.7 加权 InfoNCE ==========
+    # loss_i = -log( exp(p_i/τ) / ( exp(p_i/τ) + Σ_z w_iz·exp(n_iz/τ) ) )
+    # 数值稳定形式（logsumexp）实现在 weighted_infonce_loss 中：
+    #   loss_i = -(p_i/τ) + logsumexp( [p_i/τ, n_iz/τ + log(w_iz)] )
+    # 广播成 [P, N]：每行 = 一个正样本 vs 共享的 N 个负样本。
     neg_logits = neg_logits_pool.unsqueeze(0).expand(n_pos, _n)           # [P,N]
     return weighted_infonce_loss(pos_logits, neg_logits, w, temperature)
 
@@ -289,16 +322,12 @@ class SDCLRocketLaunching(MTLRocketLaunching2):
                 ),
             }
 
-    def _light_forward(
-        self, share: torch.Tensor
-    ) -> tuple:
+    def _light_forward(self, share: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Run the light branch on ``share`` (NOT detached).
 
         Returns:
             tower_logits: per-tower raw output tensor (no feature-sim hidden
                 features -- feature_based_distillation is dropped).
-            light_rep: the light_mlp representation, returned separately so the
-                caller can cache it for WCL without recomputing the graph.
         """
         light_in = self.ns_gate(share) if self.ns_gate is not None else share
         light_rep = self.light_mlp(light_in)
@@ -312,7 +341,7 @@ class SDCLRocketLaunching(MTLRocketLaunching2):
                 tower_logits[tower_name] = self.light_task_outputs[tower_name](
                     light_rep
                 )
-        return tower_logits, light_rep
+        return tower_logits
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Forward the model.
@@ -331,11 +360,13 @@ class SDCLRocketLaunching(MTLRocketLaunching2):
             share = net
 
         # ---- Light branch (training + inference); NO detach ----
-        light_logits, light_rep = self._light_forward(share)
+        light_logits = self._light_forward(share)
         predictions = self._tower_outputs_to_predictions(light_logits, "_light")
         if self.training:
-            # cache light_rep for WCL (training only; keep eval outputs clean).
-            predictions["light_rep"] = light_rep
+            # Cache the INPUT feature vectors (pre share_mlp) for WCL's Eq.8
+            # similarity sim(x_i, x_z) -- paper-defined on the input x, not on
+            # the learned light representation (training only; keep eval clean).
+            predictions["wcl_input_fea"] = net
 
         # ---- Booster branch (training only) ----
         if self.training:
@@ -411,12 +442,16 @@ class SDCLRocketLaunching(MTLRocketLaunching2):
         Per enabled task (opt-in via task_wcl_weights): in-batch positives are
         ``label == 1`` and the negative pool is ``label == 0``; N negatives are
         sampled (shared across positives). The adaptive negative weight (Eq.8)
-        is ``δ · (softmax_z(cos(rep_pos, rep_neg)) + sigmoid(neg_logit_z))``.
+        is ``δ · (softmax_z(cos(x_i, x_z)) + sigmoid(neg_logit_z))`` with the
+        similarity on the INPUT feature vectors x (paper Eq.8), not on the
+        learned light representation.
         """
         losses: Dict[str, torch.Tensor] = {}
-        if "light_rep" not in predictions:
+        if "wcl_input_fea" not in predictions:
             return losses
-        rep = F.normalize(predictions["light_rep"], p=2, dim=1)
+        # Paper Eq.8: sim(x_i, x_z) on the input feature vectors, L2-normalized
+        # so the dot product inside _wcl_for_task is cosine similarity.
+        fea = F.normalize(predictions["wcl_input_fea"], p=2, dim=1)
         for _tname, _cfg in self._wcl_cfgs.items():
             label = (
                 batch.labels[self._label_by_tower[_tname]]
@@ -428,7 +463,7 @@ class SDCLRocketLaunching(MTLRocketLaunching2):
             # @torch.fx.wrap leaf _wcl_for_task so this loss() path stays
             # torch.fx-traceable for TorchRec's train pipeline.
             wcl = _wcl_for_task(
-                rep,
+                fea,
                 logits,
                 label,
                 int(_cfg["num_negatives"]),
