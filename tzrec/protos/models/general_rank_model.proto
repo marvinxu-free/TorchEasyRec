@@ -243,13 +243,28 @@ message MTLRocketLaunching2 {
 // Ref: SDCL (AAAI 2025).
 // ====================================================================
 
-// Negative Sample Gate Unit (Eq.6): g = x ⊙ Gate(x),
-// Gate(x) = alpha * Sigmoid(Linear2(ReLU(Linear1(x)))).
+// Negative Sample Gate Unit (Eq.6): g = x ⊙ Gate(x). Gate is a residual-free
+// MLP whose LAST linear is zero-initialized (Gate = alpha/2 everywhere at
+// start); e.g. hidden_units 256 + 128 (two lines) builds
+// Linear(in->256) -> ReLU -> Linear(256->128) -> ReLU -> Linear(128->in).
 message NSGate {
-    // bottleneck dim; if unset, resolved to input_dim // 4 at build time.
-    optional uint32 hidden_units = 1;
+    // gate MLP hidden layer widths, one line per layer (MLP-style). A single
+    // value keeps the one-bottleneck form Linear(in->h) -> ReLU ->
+    // Linear(h->in); if unset, resolved to [input_dim // 4] at build time.
+    repeated uint32 hidden_units = 1;
     // scale alpha; Gate ∈ [0, alpha]. PEPNet-style default 2.0.
     optional float alpha = 2 [default = 2.0];
+    // per-task gates: each light task tower gets its OWN gate instead of
+    // sharing one (click vs cvr want different feature selection; the
+    // gates are light-side params, trained by that task's light losses
+    // only). The gate applies to the TASK TOWER INPUT: directly on the
+    // (detached) shared bottom when light_mlp is absent, or after the
+    // shared light_mlp when present (PEPNet-style, avoids running
+    // light_mlp once per task). Zero-init keeps Gate = alpha/2 at start
+    // for every task, so warmstarting from a shared-gate checkpoint does
+    // not disturb the served distribution. Default false = one shared
+    // gate (original SDCL Eq.6).
+    optional bool per_task = 3 [default = false];
 }
 
 // Per-task Weighted Contrastive Loss config. A tower gets WCL only if listed
@@ -258,7 +273,8 @@ message TaskWCLWeight {
     required string tower_name = 1;
     // master switch (set false to disable a listed tower).
     optional bool enable = 2 [default = true];
-    // per-task β_w (overrides model-level wcl_weight).
+    // per-task β_w^t (Eq.7). Multiplied with the model-level wcl_weight
+    // (α_w, Eq.2); defaults to 1.0 when unset.
     optional float weight = 3;
     // # negatives sampled per task per batch (N).
     optional uint32 num_negatives = 4;
@@ -266,6 +282,14 @@ message TaskWCLWeight {
     optional float temperature = 5;
     // scale δ for adaptive weight.
     optional float delta = 6;
+    // Removed 2026-08-24: hard_negative_pool_size (ANSL hard-negative
+    // shortlist, booster-scored top-H) -- falsified by run-6: selecting
+    // negatives by the booster score targets the same "click-like" cluster
+    // the positives live in, and the Eq.7 suppression landed on the whole
+    // cluster through the shared light head (light click AUC inverted to
+    // 0.43 and kept falling; see docs/sdcl_rocket_launching_dev.md §10).
+    reserved 7;
+    reserved "hard_negative_pool_size";
 }
 
 message SDCLRocketLaunching {
@@ -278,7 +302,9 @@ message SDCLRocketLaunching {
     repeated TaskTower task_towers = 5;
 
     // ===== Light (pre-ranking net, training + inference) =====
-    required MLP light_mlp = 20;
+    // optional light trunk; when omitted, the (gated) share feeds the light
+    // heads directly (via light_task_mlp when that is set).
+    optional MLP light_mlp = 20;
     optional MLP light_task_mlp = 21;
     // Negative Sample Gate Unit on the light input (Eq.6). If unset, no gate.
     optional NSGate ns_gate = 37;
@@ -289,10 +315,93 @@ message SDCLRocketLaunching {
     optional HintLossType hint_loss_type = 35 [default = HINT_BCE];
 
     // ===== Weighted Contrastive Loss (Eq.7+8), light only =====
+    // α_w: total WCL weight in Eq.2 (multiplies every task's WCL term).
     optional float wcl_weight = 38 [default = 0.1];
     optional uint32 wcl_num_negatives = 39 [default = 8];
     optional float wcl_temperature = 40 [default = 0.1];
     optional float wcl_delta = 41 [default = 1.0];
     // opt-in per-task WCL config (a tower gets WCL only if listed here).
     repeated TaskWCLWeight task_wcl_weights = 42;
+    // Removed 2026-08-24: wcl_standardize_logit (batch z-score of the light
+    // logits before Eq.7) -- KNOWN-HARMFUL and never enabled in any kept
+    // config (smoke trains 2026-08-20, three rounds: the scale-free,
+    // within-batch-only objective with a 1/σ̂ gradient amplifier drove the
+    // pooled eval AUC to exactly 0.500). Field number and name reserved.
+    reserved 43;
+    reserved "wcl_standardize_logit";
+    // Additive logit margin for the Eq.7 InfoNCE (raw logit units). A
+    // pair's gradient decays to ~0 once p - n >= margin + τ·log(Σ_z w_iz):
+    // margin > 0 hardens the separation demand, margin < 0 acts as a
+    // tolerance that relaxes the saturation threshold toward the data's
+    // discriminative scale (the default threshold τ·log(Σw) is ~1.4σ at
+    // N=32, w̄≈0.5, τ=0.5).
+    optional float wcl_margin = 44 [default = 0.0];
+    // Removed 2026-08-24: wcl_hard_negative_pool_size (model-level default
+    // for TaskWCLWeight.hard_negative_pool_size) together with the task
+    // field -- falsified by run-6, see TaskWCLWeight.hard_negative_pool_size
+    // note above.
+    reserved 46;
+    reserved "wcl_hard_negative_pool_size";
+
+    // Towers whose BOOSTER-side input is detached from the trunk (cross/deep/
+    // share), so their task loss does NOT update the shared bottom -- the
+    // bottom is then trained by the remaining towers only (e.g. click-only,
+    // the v3 baseline booster recipe). Unlike MTLRocketLaunching2 the LIGHT
+    // side is NOT detached: the listed towers' light heads still update
+    // ns_gate / light_mlp, keeping the light-side multi-task signal.
+    // The listed tower's own booster task mlp + linear still learn.
+    repeated string detached_tower_names = 45;
+}
+
+// ====================================================================
+// SDCL MaskNet + SwiGLU (sdcl_masknet_swish)
+// Same distillation/WCL/NSGate machinery as SDCLRocketLaunching; the
+// booster trunk replaces the CrossV2||Deep parallel pair with a MaskNet
+// (serial or parallel MaskBlocks, use_parallel), and ALL MLPs (MaskBlock
+// ffn via mask_block.ffn_activation, task/light/share/top MLPs via
+// MLP.activation) may switch to the gated SwiGLU activation
+// (SwiGLU(a,b) = SiLU(a) ⊗ sigmoid(b); set activation: "SwiGLU").
+// Motivation: a stronger booster trunk lifts the distillation ceiling
+// for the served light net.
+// Ref: SDCL (AAAI 2025); MaskNet (Facebook, 2020); SwiGLU (Shazeer, 2020).
+// ====================================================================
+message SDCLMasknetSwish {
+    // ===== Shared bottom (booster & light, jointly trained; NO detach) =====
+    optional MLP share_mlp = 1;
+
+    // ===== Booster trunk: MaskNet (replaces CrossV2 || Deep) =====
+    // Input LayerNorm is built into MaskNetModule; serial (use_parallel:
+    // false, output = mask_block.hidden_dim) or parallel (output =
+    // hidden_dim * n_mask_blocks) MaskBlocks, optional top_mlp on top.
+    required MaskNetModule booster_masknet = 2;
+    repeated TaskTower task_towers = 5;
+
+    // ===== Light (pre-ranking net, training + inference) =====
+    optional MLP light_mlp = 20;
+    optional MLP light_task_mlp = 21;
+    // Negative Sample Gate Unit on the light input (Eq.6). If unset, no gate.
+    optional NSGate ns_gate = 37;
+
+    // ===== Distillation (logit BCE = Eq.5; NO feature_based_sim) =====
+    optional float hint_loss_weight = 32 [default = 1.0];
+    repeated TaskDistillWeight task_distill_weights = 34;
+    optional HintLossType hint_loss_type = 35 [default = HINT_BCE];
+
+    // ===== Weighted Contrastive Loss (Eq.7+8), light only =====
+    // α_w: total WCL weight in Eq.2 (multiplies every task's WCL term).
+    optional float wcl_weight = 38 [default = 0.1];
+    optional uint32 wcl_num_negatives = 39 [default = 8];
+    optional float wcl_temperature = 40 [default = 0.1];
+    optional float wcl_delta = 41 [default = 1.0];
+    // opt-in per-task WCL config (a tower gets WCL only if listed here).
+    repeated TaskWCLWeight task_wcl_weights = 42;
+    // Additive logit margin for the Eq.7 InfoNCE (raw logit units); see
+    // SDCLRocketLaunching.wcl_margin for the exact gradient-saturation
+    // semantics (m < 0 = tolerance toward the data's effect size).
+    optional float wcl_margin = 44 [default = 0.0];
+
+    // Towers whose BOOSTER-side input is detached from the trunk
+    // (masknet / share), so their task loss does NOT update the shared
+    // bottom -- same booster-only semantics as SDCLRocketLaunching.
+    repeated string detached_tower_names = 45;
 }
