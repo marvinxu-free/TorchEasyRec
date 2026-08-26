@@ -83,6 +83,13 @@ message MaskBlock{
     optional uint32 aggregation_dim = 2;
     // the dim of hidden ffn layer
     required uint32 hidden_dim = 3;
+    // activation for the ffn projection. Default ReLU. The special value
+    // "SwiGLU" swaps the ffn linear for a gated SwiGLULinear (SiLU(a) *
+    // sigmoid(b), internal 2x width, output dim unchanged = hidden_dim;
+    // the LayerNorm then applies AFTER the gated output). The
+    // mask_generator bottleneck keeps ReLU in all cases -- it produces
+    // element-wise gate weights, as in the MaskNet paper.
+    optional string ffn_activation = 4 [default='nn.ReLU'];
 }
 
 message MaskNetModule {

@@ -15,6 +15,7 @@ import torch
 from parameterized import parameterized
 
 from tzrec.modules.mlp import MLP
+from tzrec.modules.swiglu import SwiGLULinear
 from tzrec.utils.test_util import TestGraphType, create_test_module
 
 
@@ -96,6 +97,34 @@ class MLPTest(unittest.TestCase):
         input = torch.randn(4, 2, 16)
         result = mlp(input)
         self.assertEqual(result.size(), (4, 2, 2))
+
+    @parameterized.expand(
+        [
+            [TestGraphType.NORMAL, True],
+            [TestGraphType.NORMAL, False],
+            [TestGraphType.FX_TRACE, False],
+            [TestGraphType.JIT_SCRIPT, False],
+        ]
+    )
+    def test_mlp_swiglu(self, graph_type, use_ln) -> None:
+        mlp = MLP(
+            in_features=16,
+            hidden_units=[8, 4, 2],
+            activation="SwiGLU",
+            use_ln=use_ln,
+        )
+        self.assertEqual(mlp.output_dim(), 2)
+        # each Perceptron's linear is replaced by a gated SwiGLULinear:
+        # hidden = 8/3 x 8 = 21 -> truncated to a 64-multiple -> floored
+        # at out=8; the fused gate/up GEMM is 2x that width.
+        first = mlp.mlp[0].perceptron[0]
+        self.assertIsInstance(first, SwiGLULinear)
+        self.assertEqual(first.hidden_dim, 8)
+        self.assertEqual(first.gate_up.out_features, 16)
+        mlp = create_test_module(mlp, graph_type)
+        input = torch.randn(4, 16)
+        result = mlp(input)
+        self.assertEqual(result.size(), (4, 2))
 
 
 if __name__ == "__main__":

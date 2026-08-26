@@ -15,7 +15,13 @@ import torch
 from torch import nn
 
 from tzrec.modules.activation import create_activation
+from tzrec.modules.swiglu import SwiGLULinear
 from tzrec.modules.utils import Transpose
+
+# The special activation string that swaps the Perceptron's plain
+# nn.Linear for a gated SwiGLULinear (the gated activation is built into
+# the linear, so no separate activation module is appended).
+SWIGLU_ACTIVATION = "SwiGLU"
 
 
 class Perceptron(nn.Module):
@@ -26,7 +32,11 @@ class Perceptron(nn.Module):
         out_features (int): number of elements in each output sample.
         activation (str, optional):
             the activation function to apply to the output of linear transformation.
-            Default: torch.nn.Relu.
+            Default: torch.nn.Relu. The special value "SwiGLU" replaces the
+            linear transformation with a gated :class:`SwiGLULinear`
+            (y = (SiLU(xW₁) ⊗ σ(xW₂))·W₃; hidden = 8/3 × out truncated to
+            a multiple of 64, output dim unchanged; use_bn/use_ln then
+            apply AFTER it and no separate activation module is appended).
         use_bn (bool): use batch_norm or not.
         bias (bool): if set to False, the layer will not learn an additive bias.
         dropout_ratio (float): dropout ratio of the layer.
@@ -55,9 +65,17 @@ class Perceptron(nn.Module):
             )
         self.dropout_ratio = dropout_ratio
 
-        self.perceptron = nn.Sequential(
-            nn.Linear(in_features, out_features, bias=False if use_bn else bias)
-        )
+        if activation == SWIGLU_ACTIVATION:
+            # SwiGLU fuses linear + gated activation into one module; the
+            # gated activation is intrinsic, so the create_activation
+            # branch below is skipped (norms/dropout still apply after it).
+            self.perceptron = nn.Sequential(
+                SwiGLULinear(in_features, out_features, bias=False if use_bn else bias)
+            )
+        else:
+            self.perceptron = nn.Sequential(
+                nn.Linear(in_features, out_features, bias=False if use_bn else bias)
+            )
         if use_bn:
             assert dim in [2, 3]
             if dim == 3:
@@ -67,7 +85,7 @@ class Perceptron(nn.Module):
                 self.perceptron.append(Transpose(1, 2))
         if use_ln:
             self.perceptron.append(nn.LayerNorm(out_features))
-        if activation and len(activation) > 0:
+        if activation and len(activation) > 0 and activation != SWIGLU_ACTIVATION:
             act_module = create_activation(
                 activation, hidden_size=out_features, dim=dim
             )
