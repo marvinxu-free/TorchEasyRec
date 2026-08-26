@@ -15,7 +15,7 @@ import unittest
 
 import torch
 
-from tzrec.loss.weighted_infonce import WeightedInfoNCELoss
+from tzrec.loss.weighted_infonce import WeightedInfoNCELoss, weighted_infonce_loss
 
 
 class WeightedInfoNCELossTest(unittest.TestCase):
@@ -58,7 +58,8 @@ class WeightedInfoNCELossTest(unittest.TestCase):
         p = pos / tau
         n = neg / tau
         denom = torch.exp(p) + (torch.exp(n) * w).sum(dim=1)
-        manual = torch.mean(-torch.log(torch.exp(p) / denom))
+        # Eq.7 aggregates with a SUM over positives (Σ_{i∈D^+}), not a mean.
+        manual = torch.sum(-torch.log(torch.exp(p) / denom))
         torch.testing.assert_close(loss, manual, rtol=1e-5, atol=1e-6)
 
     def test_large_logits_no_nan(self) -> None:
@@ -69,6 +70,32 @@ class WeightedInfoNCELossTest(unittest.TestCase):
         loss = loss_fn(pos, neg, w)
         self.assertFalse(torch.isnan(loss))
         self.assertTrue(torch.isfinite(loss))
+
+    def test_margin_shifts_saturation_threshold(self) -> None:
+        # margin m shifts each negative up by m inside the exponent: the
+        # loss equals the m=0 form evaluated at neg+m. m>0 hardens the
+        # separation demand, m<0 is a tolerance (loss strictly decreases).
+        torch.manual_seed(3)
+        tau = 0.5
+        pos = torch.randn(6)
+        neg = torch.randn(6, 4)
+        w = torch.rand(6, 4) + 0.5
+        base = weighted_infonce_loss(pos, neg, w, tau)
+        plus = weighted_infonce_loss(pos, neg, w, tau, margin=1.0)
+        minus = weighted_infonce_loss(pos, neg, w, tau, margin=-1.0)
+        shifted = weighted_infonce_loss(pos, neg + 1.0, w, tau)
+        self.assertGreater(plus.item(), base.item())
+        self.assertLess(minus.item(), base.item())
+        torch.testing.assert_close(plus, shifted)
+
+    def test_reduction_mean(self) -> None:
+        torch.manual_seed(4)
+        pos = torch.randn(5)
+        neg = torch.randn(5, 3)
+        w = torch.rand(5, 3) + 0.5
+        total = weighted_infonce_loss(pos, neg, w, 0.5)
+        mean = weighted_infonce_loss(pos, neg, w, 0.5, reduction="mean")
+        torch.testing.assert_close(mean * 5, total)
 
 
 if __name__ == "__main__":

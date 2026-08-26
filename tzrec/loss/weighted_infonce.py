@@ -15,10 +15,12 @@ from torch import nn
 
 
 def weighted_infonce_loss(
-    pos_logits: torch.Tensor,    # [P]
-    neg_logits: torch.Tensor,    # [P, N]
-    neg_weights: torch.Tensor,   # [P, N], strictly > 0
+    pos_logits: torch.Tensor,  # [P]
+    neg_logits: torch.Tensor,  # [P, N]
+    neg_weights: torch.Tensor,  # [P, N], strictly > 0
     temperature: float,
+    margin: float = 0.0,
+    reduction: str = "sum",
 ) -> torch.Tensor:
     """Stable Weighted InfoNCE (SDCL Eq.7). Single source of truth.
 
@@ -27,14 +29,34 @@ def weighted_infonce_loss(
     loss math without a Module -- e.g. the SDCL model's WCL path, whose in-batch
     sampling is data-dependent (``.item()`` / ``nonzero`` / ``randint``) and is
     run behind a ``@torch.fx.wrap`` leaf so TorchRec's symbolic trace skips it.
+
+    ``margin`` (additive logit margin, default 0 = paper form) shifts each
+    negative up by ``m`` inside the exponent: a pair's gradient decays to ~0
+    once ``p_i - n_iz >= m + τ·log(Σ_z w_iz)``. ``m > 0`` hardens the
+    separation demand; ``m < 0`` acts as a tolerance that relaxes the
+    threshold toward the data's discriminative scale.
+
+    ``reduction``: ``"sum"`` follows the paper's Eq.7 literally
+    (``Σ_{i∈D^+}``) and keeps the per-logit gradient O(α/τ) INDEPENDENT of
+    the positive count P -- provided each row has its OWN negatives
+    (per-positive sampling): a positive appears in exactly one row (force
+    ``α/τ``) and a negative appears in ``k ≈ N·P/pool`` rows (force
+    ``α·k/τ``). Sharing N negatives across all P rows instead concentrates
+    ``α·P/τ`` on each sampled negative logit (~300× BCE at batch 4096),
+    which dominated and collapsed the light tower in smoke training
+    (2026-08-20); a ``mean`` over P would err the other way (force
+    ``α/(τ·P)``, invisible). The per-task weight ``β_w^t`` and the
+    cross-task sum are applied by the caller.
     """
-    p = pos_logits / temperature                              # [P]
-    n = neg_logits / temperature                              # [P, N]
-    # log(w · exp(n)) = n + log(w); concat with p column and logsumexp.
-    neg_term = n + torch.log(neg_weights)                     # [P, N]
-    logits = torch.cat([p.unsqueeze(1), neg_term], dim=1)     # [P, 1 + N]
-    loss = -p + torch.logsumexp(logits, dim=1)                # [P]
-    return loss.mean()
+    p = pos_logits / temperature  # [P]
+    n = (neg_logits + margin) / temperature  # [P, N]
+    # log(w · exp(n + m)) = (n + m)/τ + log(w); concat with p column.
+    neg_term = n + torch.log(neg_weights)  # [P, N]
+    logits = torch.cat([p.unsqueeze(1), neg_term], dim=1)  # [P, 1 + N]
+    loss = -p + torch.logsumexp(logits, dim=1)  # [P]
+    if reduction == "mean":
+        return loss.mean()
+    return loss.sum()
 
 
 class WeightedInfoNCELoss(nn.Module):
@@ -51,6 +73,12 @@ class WeightedInfoNCELoss(nn.Module):
 
     which equals ``log( 1 + Σ_z w_iz · exp((n_iz - p_i)/τ) )`` >= 0.
 
+    Aggregation defaults to the paper's ``Σ_{i∈D^+}`` (SUM over the positives
+    of ONE task; pass ``reduction="mean"`` for a batch-size-independent
+    variant -- see :func:`weighted_infonce_loss`). The per-task weight
+    ``β_w^t`` (Eq.7) and the total weight ``α_w`` (Eq.2) are applied by the
+    caller.
+
     This module holds no learnable parameters (the temperature is a constant).
     Sampling of positives/negatives and computation of the adaptive weights
     (Eq.8) are done by the caller; this module only implements the loss math.
@@ -65,10 +93,11 @@ class WeightedInfoNCELoss(nn.Module):
 
     def forward(
         self,
-        pos_logits: torch.Tensor,   # [P]
-        neg_logits: torch.Tensor,   # [P, N]
+        pos_logits: torch.Tensor,  # [P]
+        neg_logits: torch.Tensor,  # [P, N]
         neg_weights: torch.Tensor,  # [P, N], strictly > 0
     ) -> torch.Tensor:
+        """Compute the weighted InfoNCE loss (paper Eq.7, sum reduction)."""
         return weighted_infonce_loss(
             pos_logits, neg_logits, neg_weights, self.temperature
         )
