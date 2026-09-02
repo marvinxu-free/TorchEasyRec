@@ -19,7 +19,13 @@ import torch
 from tzrec.protos.export_pb2 import ExportConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import TrainConfig
+from tzrec.utils import quant_util
 from tzrec.utils.logging_util import logger
+
+
+def use_distributed_embedding() -> bool:
+    """Export model for distributed embedding mode of EAS processor."""
+    return os.environ.get("USE_DISTRIBUTED_EMBEDDING", "0") == "1"
 
 
 def is_input_tile() -> bool:
@@ -237,6 +243,27 @@ def ec_quant_dtype() -> torch.dtype:
         return _quant_str_to_dtype[quant_dtype_str]
 
 
+def _normalized_distributed_sparse_quant() -> str:
+    return os.environ.get("DIST_QUANT", "").strip().upper()
+
+
+def is_distributed_sparse_quant() -> bool:
+    """Whether distributed sparse artifacts should be rowwise quantized."""
+    quant = _normalized_distributed_sparse_quant()
+    if quant in ("", "0", "NONE"):
+        return False
+    if quant == "INT8":
+        return True
+    raise ValueError("Unsupported DIST_QUANT: %s, only INT8 is supported." % quant)
+
+
+def distributed_sparse_quant_format() -> str:
+    """Get distributed sparse artifact quantization format."""
+    if not is_distributed_sparse_quant():
+        return ""
+    return quant_util.DISTRIBUTED_SPARSE_SUPPORTED_QUANT_FORMATS[0]
+
+
 _MIXED_PRECISION_TO_DTYPE: Dict[str, torch.dtype] = {
     "BF16": torch.bfloat16,
     "FP16": torch.float16,
@@ -285,57 +312,25 @@ def mixed_precision_for_export(pipeline_config: EasyRecConfig) -> str:
     return export_mp
 
 
-def write_mapping_file_for_input_tile(
-    state_dict: Dict[str, torch.Tensor], remap_file_path: str
-) -> None:
-    r"""Mapping ebc params to ebc_user and ebc_item Updates the model's state.
-
-    dictionary with adapted parameters for the input tile.
-
-    Args:
-        state_dict (Dict[str, torch.Tensor]): model state_dict
-        remap_file_path (str) : store new_params_name\told_params_name\n
-    """
-    input_tile_mapping = {
-        ".ebc_user.embedding_bags.": ".ebc.embedding_bags.",
-        ".mc_ebc_user._embedding_module.": ".mc_ebc._embedding_module.",
-        ".mc_ebc_user._managed_collision_collection.": ".mc_ebc._managed_collision_collection.",  # NOQA
-        ".ec_list_user.": ".ec_list.",
-        ".mc_ec_list_user.": ".mc_ec_list.",
-        ".ec_dict_user.": ".ec_dict.",
-        ".mc_ec_dict_user.": ".mc_ec_dict.",
-    }
-
-    remap_str = ""
-    for key, _ in state_dict.items():
-        for input_tile_key in input_tile_mapping:
-            if input_tile_key in key:
-                src_key = key.replace(
-                    input_tile_key, input_tile_mapping[input_tile_key]
-                )
-                remap_str += key + "\t" + src_key + "\n"
-
-    with open(remap_file_path, "w") as f:
-        f.write(remap_str)
-
-
 def export_acc_config(
-    additional_export_config: Optional[Dict[str, str]] = None,
-) -> Dict[str, str]:
+    additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
+) -> Dict[str, Union[bool, str]]:
     """Export acc config for model online inference.
 
     Args:
         additional_export_config (dict, optional): extra key/value pairs merged
-            into the acc config (overriding env-derived defaults on conflict).
+            into the acc config.
     """
     # use int64 sparse id as input
-    acc_config = {"SPARSE_INT64": "1"}
+    acc_config: Dict[str, Union[bool, str]] = {"SPARSE_INT64": "1"}
     if "INPUT_TILE" in os.environ:
         acc_config["INPUT_TILE"] = os.environ["INPUT_TILE"]
     if "QUANT_EMB" in os.environ:
         acc_config["QUANT_EMB"] = os.environ["QUANT_EMB"]
     if "QUANT_EC_EMB" in os.environ:
         acc_config["QUANT_EC_EMB"] = os.environ["QUANT_EC_EMB"]
+    if use_distributed_embedding() and is_distributed_sparse_quant():
+        acc_config["DIST_QUANT"] = "INT8"
     if "ENABLE_TRT" in os.environ:
         acc_config["ENABLE_TRT"] = os.environ["ENABLE_TRT"]
     if "AOTI_AUTOTUNE_WITH_SAMPLE_INPUTS" in os.environ:
@@ -350,6 +345,8 @@ def export_acc_config(
         acc_config["ENABLE_AOT"] = "2" if is_unified_aot() else "1"
     if additional_export_config:
         acc_config.update(additional_export_config)
+    if use_distributed_embedding():
+        acc_config["DISTRIBUTED_EMBEDDING"] = "1"
     return acc_config
 
 

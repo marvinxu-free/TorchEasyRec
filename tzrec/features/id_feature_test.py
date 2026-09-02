@@ -100,6 +100,7 @@ class IdFeatureTest(unittest.TestCase):
         [
             ["lambda x: probabilistic_threshold_filter(x,0.05)"],
             ["lambda x: (x > 10, 10)"],
+            ["partial(dynamic_threshold_filter, threshold_skew_multiplier=1.0)"],
         ],
         name_func=test_util.parameterized_name_func,
     )
@@ -308,6 +309,7 @@ class IdFeatureTest(unittest.TestCase):
         self.assertEqual(repr(id_feat.emb_bag_config), repr(expected_emb_bag_config))
         fg_default = id_feat.fg_encoded_default_value()
         if expected_fg_default:
+            assert fg_default is not None
             np.testing.assert_allclose(fg_default, expected_fg_default)
         else:
             self.assertEqual(fg_default, expected_fg_default)

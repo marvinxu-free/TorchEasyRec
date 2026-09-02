@@ -14,6 +14,7 @@ export_config {
   - best 导出最好的模型
 - best_exporter_metric: 当exporter_type为best的时候，确定最优导出模型的metric，注意该metric要在对应任务的metrics设置了才行。对于多任务模型则需要设置 {metric_name}\_{tower_name}。
 - metric_larger_is_better: 确定最优导出模型的metric是越大越好，还是越小越好，默认是越大越好
+- use_dense_ema: 是否使用稠密EMA参数导出模型。未配置时默认跟随`train_config.dense_optimizer.ema`是否启用；可显式配置为`true`或`false`覆盖默认行为，在线Dense导出同样使用该配置
 
 ## 导出命令
 
@@ -45,9 +46,66 @@ torchrun --master_addr=localhost --master_port=32555 \
   - **INPUT_TILE=3**：user侧fg和embedding计算仅一次，适用于user侧特征比较多的情况
 - INPUT_TILE_3_ONLINE: 配合INPUT_TILE=3使用，对User侧序列特征使用在线推理模式，序列特征在线模型服务中推理性能更好，但导出的模型无法用于离线预测
   - **INPUT_TILE_3_ONLINE=1**：启用序列特征的在线推理模式
+- USE_DISTRIBUTED_EMBEDDING: 开启分布式 embedding 导出模式，导出 dense graph 与分片 sparse embedding 参数；该模式会自动使用 `INPUT_TILE=3`
+  - **USE_DISTRIBUTED_EMBEDDING=1**：启用分布式 embedding 导出
+  - 配置了 zch 的特征会自动转换为动态表导出，详见 [零冲突Hash Embedding](../feature/zch.md) 的分布式 Embedding 导出章节
+- DIST_QUANT: 分布式 embedding 导出模式下的 sparse embedding 参数量化开关，默认关闭；当前仅支持 INT8，与普通导出的 `QUANT_EMB` / `QUANT_EC_EMB` 不同
+  - **USE_DISTRIBUTED_EMBEDDING=1 DIST_QUANT=INT8**：启用分布式 sparse embedding INT8 量化
+  - 未设置 **DIST_QUANT** 时，不启用分布式 sparse embedding 量化
 - ENABLE_AOT: 使用AOT(Ahead Of Time)编译优化导出的模型，可显著提升推理性能。**AOT 编译产物与导出机器的 GPU 架构强绑定，在线服务的 GPU 类型必须与导出时使用的 GPU 类型完全一致**，详见下文 [在 PAI 上导出 AOT 模型](#export-aot-on-pai) 章节
   - **ENABLE_AOT=1**: 使用AOT编译优化导出模型（sparse 部分用 JIT，dense 部分用 AOTI）
   - **ENABLE_AOT=2**: 使用统一 AOTI 模型编译优化 (sparse + dense 融合为单一 .pt2) [experimental]
+
+(online-dense-export)=
+
+## 在线学习 dense 模型热导出
+
+在 `USE_DISTRIBUTED_EMBEDDING=1` 的在线学习场景下，sparse embedding 由分布式 embedding 服务独立更新，训练进程可以在训练过程中按分钟级（或自定义节奏）持续导出 dense 图，供推理 Processor 热切换。该能力**不依赖 checkpoint**：rank 0 在训练启动时一次性构建 serving 侧 dense 图，之后每次触发时全体 rank 从内存中的 DMP 模型收集 dense 权重（仅收集 dense 图实际携带的参数，不涉及 sparse/dynamicemb/MCH 状态），rank 0 在后台线程热替换权重、script 并原子发布新版本，训练主流程不阻塞在导出上。
+
+### 启用方式
+
+训练命令前加上以下环境变量即可（`ONLINE_DENSE_EXPORT_DIR` 与 `ONLINE_DENSE_EXPORT_STEPS` / `ONLINE_DENSE_EXPORT_INTERVAL` 至少一项为必填）：
+
+```bash
+ONLINE_DENSE_EXPORT=1 \
+ONLINE_DENSE_EXPORT_DIR=/mnt/data/serving \
+ONLINE_DENSE_EXPORT_INTERVAL=60 \
+torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
+    --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
+    -m tzrec.train_eval \
+    --pipeline_config_path experiments/online_learning/pipeline.config
+```
+
+### 环境变量
+
+- ONLINE_DENSE_EXPORT: 开启训练内在线 dense 导出，默认关闭
+  - **ONLINE_DENSE_EXPORT=1**：启用（要求同时设置 `USE_DISTRIBUTED_EMBEDDING=1`）
+- ONLINE_DENSE_EXPORT_DIR: 在线服务读取的根目录（必填）。导出产物发布在 `<ONLINE_DENSE_EXPORT_DIR>/dense_hot_export` 下，必须为本地路径（发布依赖 `os.rename` 原子换版）；`model_dir` 可以是远端（如 OSS）
+- ONLINE_DENSE_EXPORT_STEPS: 按训练步数间隔触发导出（如 `300` 表示每 300 步导出一次），0 表示关闭
+- ONLINE_DENSE_EXPORT_INTERVAL: 按数据事件时间（`Batch.data_timestamp`，Unix 秒）间隔触发导出（如 `60` 表示每消费过 60 秒事件时间、且跨过整分边界时导出一次），0 表示关闭。事件时间触发会在各 rank 间做 quorum 对齐，与 checkpoint 的时间触发机制一致
+- ONLINE_DENSE_EXPORT_QUORUM: 事件时间触发的 worker 越界比例阈值，取值 (0, 1\]，默认 0.5
+- ONLINE_DENSE_EXPORT_KEEP_VERSIONS: 保留的历史版本数，默认 0（不删除任何已导出的版本）。大于 0 时保留最新 K 个版本，且 K 最小为 3（serving 需要当前版本 + 上一版本用于原子切换）。`current.json` 指向的版本永远不被清理
+- ONLINE_DENSE_EXPORT_TIMEOUT: 单次导出的预算秒数，默认 3600。超时不会中断导出线程，仅打印告警，并用于训练结束时 drain 的等待上限
+
+`ONLINE_DENSE_EXPORT_STEPS` 与 `ONLINE_DENSE_EXPORT_INTERVAL` 至少要设置一个；训练结束时还会强制导出一次最终状态。导出频率与 checkpoint 频率完全独立，checkpoint 仍按原有配置保存、用于训练恢复。
+
+### 运行与排障说明
+
+- 仅 rank 0 执行建图与发布；启动时会对整条建图 + script 链路做一次试运行，任何 trace/script 失败会在训练开始前就暴露（fail-fast）。
+- 启动时还会校验 dense 图的每个参数都能在训练模型 state dict 中找到来源（INPUT_TILE=3 的 user 侧孪生模块自动回落到非 user 侧权重），校验失败训练不会启动。
+- 导出在后台线程执行，失败（日志中 `online dense export task failed`）只跳过该版本、不影响训练，也不改变 `current.json` 指向。
+- 两次导出间隔小于单次导出耗时时，排队中的旧任务被最新版本顶替（latest-wins），不产生积压。
+- MatchModel（向量召回）与 TDM 模型的完整导出按 user/item（或按模块）分目录，与单体 dense 热导出的布局不兼容，启用会直接报错，请使用完整的 `tzrec.export`。
+- 手动/离线从某个 checkpoint 导出一个版本（与训练内导出发布到同一目录结构）：
+
+```bash
+USE_DISTRIBUTED_EMBEDDING=1 ONLINE_DENSE_EXPORT_DIR=/mnt/data/serving \
+python -m tzrec.tools.online_dense_export \
+    --pipeline_config_path experiments/online_learning/pipeline.config \
+    --checkpoint_path /mnt/data/model/model.ckpt-1200 \
+    --model_dir /mnt/data/model \
+    --checkpoint_step 1200
+```
 
 (export-aot-on-pai)=
 
@@ -95,9 +153,9 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
     },
     "containers": [
         {
-            "image": "dsw-registry-vpc.{region}.cr.aliyuncs.com/pai/torcheasyrec:1.2.0-pytorch2.11.0-gpu-py311-cu129-ubuntu22.04",
+            "image": "dsw-registry-vpc.{region}.cr.aliyuncs.com/pai/torcheasyrec:1.4.0-pytorch2.13.0-gpu-py311-cu126-ubuntu22.04",
             "port": 8000,
-            "script": "set -e\npip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com\n\nCUDA_HOME=/usr/local/cuda-12 ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \\\nENABLE_AOT=1 QUANT_EC_EMB=INT8 \\\ntorchrun --master_addr=127.0.0.1 --master_port=12345 \\\n    --nnodes=1 --nproc-per-node=1 --node_rank=0 \\\n    -m tzrec.export \\\n    --pipeline_config_path /mnt/data/${MODEL_DIR}/pipeline.config \\\n    --export_dir /mnt/data/${MODEL_DIR}/export/ \\\n    --additional_export_config '{\"cand_seq_pk\": \"cand_seq\"}'"
+            "script": "set -e\npip install tzrec[cu126]==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com\n\nCUDA_HOME=/usr/local/cuda-12 ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \\\nENABLE_AOT=1 QUANT_EC_EMB=INT8 \\\ntorchrun --master_addr=127.0.0.1 --master_port=12345 \\\n    --nnodes=1 --nproc-per-node=1 --node_rank=0 \\\n    -m tzrec.export \\\n    --pipeline_config_path /mnt/data/${MODEL_DIR}/pipeline.config \\\n    --export_dir /mnt/data/${MODEL_DIR}/export/ \\\n    --additional_export_config '{\"cand_seq_pk\": \"cand_seq\"}'"
         }
     ],
     "metadata": {

@@ -13,7 +13,7 @@
 import threading
 from collections import OrderedDict
 from queue import Queue
-from typing import Any, Dict, Final, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Final, Iterable, List, Optional, Tuple, cast
 
 import torch
 import torchmetrics
@@ -32,7 +32,11 @@ from tzrec.loss.pe_mtl_loss import ParetoEfficientMultiTaskLoss
 from tzrec.modules.utils import BaseModule
 from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.model_pb2 import FeatureGroupConfig, ModelConfig
+from tzrec.utils import config_util
+from tzrec.utils.fx_util import fx_get_label
 from tzrec.utils.load_class import get_register_class_meta
+
+torch.fx.wrap(fx_get_label)
 
 _MODEL_CLASS_MAP = {}
 _meta_cls = get_register_class_meta(_MODEL_CLASS_MAP)
@@ -62,9 +66,14 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
         self._features = features
         self._feature_groups = list(model_config.feature_groups)
         self._labels = labels
-        self._model_config = (
-            getattr(model_config, self._model_type) if self._model_type else None
-        )
+        if self._model_type == "custom_model":
+            self._model_config = config_util.unpack_any(
+                model_config.custom_model.config
+            )
+        elif self._model_type:
+            self._model_config = getattr(model_config, self._model_type)
+        else:
+            self._model_config = None
         self._metric_modules = nn.ModuleDict()
         self._loss_modules = nn.ModuleDict()
 
@@ -82,6 +91,21 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
     def feature_groups(self) -> List[FeatureGroupConfig]:
         """Model's feature_groups (default forward to ``self._feature_groups``)."""
         return self._feature_groups
+
+    def get_label(self, batch: Batch, label_name: str) -> torch.Tensor:
+        """Get a label of the batch.
+
+        A label stored as a list column is parsed into a jagged label, take its
+        values so that fixed-length list labels can be used as ordinary labels.
+
+        Args:
+            batch (Batch): input batch data.
+            label_name (str): name of the label.
+
+        Return:
+            label (Tensor): label tensor.
+        """
+        return fx_get_label(batch.labels, batch.jagged_labels, label_name)
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Predict the model.
@@ -149,6 +173,11 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
         for metric_name, metric in self._train_metric_modules.items():
             metric_results[metric_name] = metric.compute()
         return metric_results
+
+    def reset_train_metric(self) -> None:
+        """Reset train metric state."""
+        for metric in self._train_metric_modules.values():
+            metric.reset()
 
     def on_train_end(self) -> None:
         """Hook fired once after the train_eval loop exits.
@@ -419,12 +448,12 @@ class ScriptWrapper(BaseModule):
     @property
     def features(self) -> List[BaseFeature]:
         """Live read of the wrapped module's features (no snapshot)."""
-        return self.model.features
+        return cast(List[BaseFeature], self.model.features)
 
     @property
     def feature_groups(self) -> List[FeatureGroupConfig]:
         """Live read of the wrapped module's feature_groups."""
-        return self.model.feature_groups
+        return cast(List[FeatureGroupConfig], self.model.feature_groups)
 
     def get_batch(
         self,
@@ -551,7 +580,7 @@ class CombinedModelWrapper(nn.Module):
         device: torch.device,
     ) -> Dict[str, torch.Tensor]:
         torch.cuda.set_device(device)
-        with self._lock:
+        with cast(Any, self._lock):
             return self.dense_model(sparse_out)
 
     def forward(
@@ -582,6 +611,10 @@ class UnifiedAOTIModelWrapper(nn.Module):
         model (nn.Module): unified AOTInductor compiled model.
     """
 
+    # Set through object.__setattr__, so declare the types here. _lock cannot be
+    # declared: torch.jit.script rejects a threading.Lock annotation.
+    _key_order: Optional[List[str]]
+
     def __init__(self, model: nn.Module) -> None:
         super().__init__()
         self.model = model
@@ -608,10 +641,12 @@ class UnifiedAOTIModelWrapper(nn.Module):
         Return:
             predictions (dict): a dict of predicted result.
         """
-        if self._key_order is None:
-            object.__setattr__(self, "_key_order", sorted(data.keys()))
-        data = OrderedDict((k, data[k]) for k in self._key_order)
+        key_order = self._key_order
+        if key_order is None:
+            key_order = sorted(data.keys())
+            object.__setattr__(self, "_key_order", key_order)
+        data = OrderedDict((k, data[k]) for k in key_order)
         # Force CUDA primary context creation on worker threads.
         torch.cuda.set_device(device)
-        with self._lock:
+        with cast(Any, self._lock):
             return self.model(data)

@@ -41,6 +41,7 @@ from tzrec.datasets.utils import (
 )
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
+from tzrec.utils import config_util
 from tzrec.utils.load_class import get_register_class_meta
 from tzrec.utils.logging_util import logger
 
@@ -134,11 +135,13 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             sampler_type=self.sampler_type,
         )
 
-        self._input_fields = None
+        self._input_fields: Optional[List[pa.Field]] = None
         self._selected_input_names = set()
         self._selected_input_names |= self._data_parser.feature_input_names
         if self._mode == Mode.PREDICT:
-            self._selected_input_names |= set(self._reserved_columns)
+            self._selected_input_names |= set(self._reserved_columns) - {
+                "ALL_EFFECTIVE_COLUMNS"
+            }
         else:
             self._selected_input_names |= set(data_config.label_fields)
             self._selected_input_names |= set(data_config.sample_weight_fields)
@@ -181,15 +184,15 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                         "grouped sequence; only grouped sequence sub-features "
                         "are supported as item_id_field."
                     )
-                self._sampler_seq_delim = feature.sequence_delim
-                self._sampler_seq_prefix = feature.grouped_sequence_prefix
+                self._sampler_seq_delim = feature.sequence_delim or ""
+                self._sampler_seq_prefix = feature.grouped_sequence_prefix or ""
                 break
 
         self._fg_mode = data_config.fg_mode
         self._fg_encoded_multival_sep = data_config.fg_encoded_multival_sep
 
-        if mode != Mode.TRAIN and data_config.HasField("eval_batch_size"):
-            self._batch_size = data_config.eval_batch_size
+        if mode != Mode.TRAIN:
+            self._batch_size = config_util.get_inference_batch_size(data_config)
         else:
             self._batch_size = data_config.batch_size
 
@@ -269,6 +272,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         """Input fields info, overwrote by subclass for auto infer the info."""
         if self._input_fields is None:
             self._init_input_fields()
+        assert self._input_fields is not None
         return self._input_fields
 
     def get_worker_info(self) -> Tuple[int, int]:
@@ -306,6 +310,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         worker_id, num_workers = self.get_worker_info()
         for input_data in self._reader.to_batches(worker_id, num_workers):
             yield self._build_batch(input_data)
+        # pass complete: clear the resume state so later epochs do full passes
+        self._reader.load_state_dict(None)
 
     def _build_batch(self, input_data: Dict[str, pa.Array]) -> Batch:
         """Process input data and build batch.
@@ -363,9 +369,9 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         if self._mode == Mode.PREDICT:
             batch = self._data_parser.to_batch(output_data, force_no_tile=True)
             reserved_data = {}
-            if (
-                len(self._reserved_columns) > 0
-                and self._reserved_columns[0] == "ALL_COLUMNS"
+            if len(self._reserved_columns) > 0 and self._reserved_columns[0] in (
+                "ALL_COLUMNS",
+                "ALL_EFFECTIVE_COLUMNS",
             ):
                 reserved_data = input_data
             else:
@@ -756,6 +762,7 @@ def create_dataloader(
     mode: Mode = Mode.TRAIN,
     gl_cluster: Optional[Dict[str, Union[int, str]]] = None,
     debug_level: int = 0,
+    checkpoint_state: Optional[Dict[str, Any]] = None,
 ) -> DataLoader:
     """Build dataloader.
 
@@ -768,6 +775,8 @@ def create_dataloader(
         gl_cluster (dict, bool): if set, reuse the graphlearn cluster.
         debug_level (int): dataset debug level, when mode=predict and
             debug_level > 0, will dump fg encoded data to debug_str
+        checkpoint_state (dict, optional): resume state, applied before the
+            eager ``iter()`` forks workers so it reaches them.
 
     Return:
         dataloader (dataloader): a DataLoader.
@@ -783,6 +792,8 @@ def create_dataloader(
         mode=mode,
         debug_level=debug_level,
     )
+    if checkpoint_state:
+        dataset.load_state_dict(dict(checkpoint_state))
 
     kwargs = {}
     if data_config.num_workers < 1:
@@ -829,10 +840,21 @@ def create_dataloader(
         batch_size=None,
         pin_memory=data_config.pin_memory if mode != Mode.PREDICT else False,
         collate_fn=lambda x: x,
+        in_order=data_config.in_order,
         **kwargs,
     )
     # For PyTorch versions 2.6 and above, we initialize the data iterator before
     # beginning the training process to avoid potential CUDA-related issues following
     # model saving.
-    iter(dataloader)
+    first_iterator = iter(dataloader)
+
+    def get_iterator() -> Iterator[Batch]:
+        # return the eager iterator first (keeps its prefetch), then fresh ones
+        nonlocal first_iterator
+        if first_iterator is not None:
+            it, first_iterator = first_iterator, None
+            return it
+        return iter(dataloader)
+
+    dataloader.get_iterator = get_iterator  # pyre-ignore[16]
     return dataloader

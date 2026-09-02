@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import gc
 import random
 import unittest
 from typing import Optional
@@ -20,6 +19,7 @@ from hypothesis import strategies as st
 
 from tzrec.ops import Kernel
 from tzrec.utils.test_util import (
+    cleanup_cuda_memory,
     generate_sparse_seq_len,
     get_test_dtypes,
     get_test_enable_tma,
@@ -29,13 +29,10 @@ from tzrec.utils.test_util import (
 from tzrec.utils.test_util import hypothesis_settings as settings
 
 
-@mark_ci_scope("h20")
+@mark_ci_scope("h20", "gpu")
 class HSTUComputeTest(unittest.TestCase):
     def teardown_example(self, example):
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.memory_summary()  # prevent oom
+        cleanup_cuda_memory()
 
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore[56]
@@ -495,7 +492,7 @@ class HSTUComputeTest(unittest.TestCase):
             )
 
 
-@mark_ci_scope("h20")
+@mark_ci_scope("h20", "gpu")
 class Hstu4WayRematParityTest(unittest.TestCase):
     """Forward + backward parity for ``hstu_compute_uqvk``'s 4 remat combos.
 

@@ -324,7 +324,10 @@ class SeqMockInput(MockInput):
         data = {}
         for name, arr in zip(t.column_names, t.columns):
             if name in self.side_infos:
-                data[f"{self.name}{self.sequence_underline}{name}"] = arr
+                # pandas>=3 `from_pandas` yields large_string; cast back to string.
+                data[f"{self.name}{self.sequence_underline}{name}"] = arr.cast(
+                    pa.string()
+                )
 
         return data
 
@@ -614,7 +617,7 @@ def create_mock_hard_negative(
     user_path: str,
     src_data: Dict[str, List],  # {user_id: user_t, item_id: item_t}
     num_rows: int = 10240,
-) -> Tuple[str]:
+) -> Tuple[str, str]:
     """Create hard negative mock data."""
     idx_1 = np.random.choice(
         np.arange(len(src_data["user_id"])), num_rows, replace=False
@@ -646,7 +649,7 @@ def build_mock_input_fg_encoded(
     features: List[BaseFeature], user_id: str = "", item_id: str = ""
 ) -> Dict[str, MockInput]:
     """Build fg encoded mock input instance list from features."""
-    inputs = {}
+    inputs: Dict[str, MockInput] = {}
     single_id_fields = {user_id, item_id}
     for feature in features:
         if feature.is_sequence:
@@ -705,7 +708,7 @@ def build_mock_input_with_fg(
     features: List[BaseFeature],
     user_id: str = "",
     item_id: str = "",
-) -> Dict[str, MockInput]:
+) -> Tuple[Dict[str, MockInput], Dict[str, MockInput]]:
     """Build mock input instance list with fg from features."""
     inputs = defaultdict(dict)
     single_id_fields = {user_id, item_id}
@@ -867,6 +870,8 @@ def load_config_for_test(
 
     data_config.num_workers = 2
     num_parts = data_config.num_workers * 2
+    user_t = None
+    item_t = None
     if data_config.fg_mode == FgMode.FG_NONE:
         inputs = build_mock_input_fg_encoded(features, user_id, item_id)
         item_inputs = inputs
@@ -933,6 +938,7 @@ def load_config_for_test(
         sampler_config = getattr(data_config, sampler_type)
     if sampler_type is not None:
         if sampler_type == "tdm_sampler":
+            assert item_t is not None
             all_attr_fields = item_t.column_names
             attr_fields = []
             raw_attr_fields = []
@@ -998,6 +1004,7 @@ def load_config_for_test(
                 num_rows=data_config.batch_size * num_parts * 4,
             )
 
+            assert user_t is not None and item_t is not None
             hard_neg_edge_path, hard_neg_user_path = create_mock_hard_negative(
                 os.path.join(test_dir, "hard_neg_edge"),
                 os.path.join(test_dir, "hard_neg_user"),
@@ -1037,6 +1044,7 @@ def test_train_eval(
     num_rows: Optional[int] = None,
     learnable_label: Optional[str] = None,
     num_epochs: Optional[int] = None,
+    pythonpath: str = ".",
 ) -> bool:
     """Run train_eval integration test."""
     pipeline_config = load_config_for_test(
@@ -1054,7 +1062,7 @@ def test_train_eval(
     config_util.save_message(pipeline_config, test_config_path)
     log_dir = os.path.join(test_dir, "log_train_eval")
     cmd_str = (
-        f"PYTHONPATH=. torchrun {_standalone()} "
+        f"PYTHONPATH={pythonpath} torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node={_get_nproc_per_node()} --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/train_eval.py "
         f"--pipeline_config_path {test_config_path} {args_str}"
@@ -1070,11 +1078,12 @@ def test_eval(
     pipeline_config_path: str,
     test_dir: str,
     env_str: str = "",
+    pythonpath: str = ".",
 ) -> bool:
     """Run evaluate integration test."""
     log_dir = os.path.join(test_dir, "log_eval")
     cmd_str = (
-        f"PYTHONPATH=. torchrun {_standalone()} "
+        f"PYTHONPATH={pythonpath} torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node={_get_nproc_per_node()} --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/eval.py "
         f"--pipeline_config_path {pipeline_config_path}"
@@ -1094,12 +1103,13 @@ def test_export(
     env_str: str = "",
     additional_export_config: str = "",
     item_input_path: str = "",
+    pythonpath: str = ".",
 ) -> bool:
     """Run export integration test."""
     log_dir = os.path.join(test_dir, "log_export")
     export_dir = export_dir or f"{test_dir}/export"
     cmd_str = (
-        f"PYTHONPATH=. torchrun {_standalone()} "
+        f"PYTHONPATH={pythonpath} torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node={_get_nproc_per_node()} --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/export.py "
         f"--pipeline_config_path {pipeline_config_path} "

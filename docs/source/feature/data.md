@@ -99,7 +99,7 @@ data_config {
 - 输入消息流的内容是序列化的ArrowRecordBatch，支持两种序列化格式:
 
   - schema-less格式 (`record_batch.serialize()`): 需设置`data_config.input_fields`或`data_config.input_fields_str`来指定数据的schema
-  - 带schema的格式 (Arrow IPC Stream): 无需设置`input_fields`，schema从消息中自动推断，但schema会占用消息体大小
+  - 带schema的格式 (Arrow IPC Stream): 无需设置`input_fields`，schema从消息中自动推断，上游新增列或调整列顺序无需重启训练即可自动适配，上游删除或修改Reader所需列（列名/类型）时会报错，且schema会占用消息体大小
 
 - input_path: 按如下格式设置
 
@@ -234,7 +234,7 @@ pipeline.global-job-parameters: |
 - 训练时不会在Dataset中执行FG，输入数据为Fg编码后的数据，数据列名与**特征名**(`feature_name`)同名，Dataset会自动分析所有特征的特征名来读取数据
   - 以上文LookupFeature为例，**特征名**为`lookup_feat`，Dataset会从输入表中直接读取编码后的`lookup_feat`列直接进行模型训练和推理
 - 该模式训练速度最佳，但需提前对数据提前进行FG编码，目前仅提供MaxCompute方式，步骤如下：
-  - 在DLC/DSW/Local环境中生成fg json配置，上传至DataWorks的资源中，如果fg_output_dir中有vocab_file等其他文件，也需要上传至资源中
+  - 在DLC/DSW/Local环境中生成fg json配置，上传至DataWorks的资源中，如果fg_output_dir中有vocab_file、自定义算子so等其他文件，也需要上传至资源中（`pyfg/lib/`开头的官方算子so由MaxCompute FG自行提供，不会输出到fg_output_dir中）
     ```shell
     cat <<EOF>> odps_conf
     access_id=${ACCESS_ID}
@@ -258,11 +258,11 @@ pipeline.global-job-parameters: |
     - --ODPS_CONFIG_FILE_PATH: 该环境变量指向的是odpscmd的配置文件
   - 在[DataWorks](https://workbench.data.aliyun.com/)的独享资源组中安装pyfg，「资源组列表」- 在一个调度资源组的「操作」栏 点「运维助手」-「创建命令」（选手动输入）-「运行命令」
     ```shell
-    /home/tops/bin/pip3 install http://tzrec.oss-accelerate.aliyuncs.com/third_party/pyfg104-1.0.4-cp37-cp37m-linux_x86_64.whl --index-url=https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.cloud.aliyuncs.com
+    /home/tops/bin/pip3 install http://tzrec.oss-accelerate.aliyuncs.com/third_party/pyfg106-1.0.6-cp37-cp37m-linux_x86_64.whl --index-url=https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.cloud.aliyuncs.com
     ```
   - 在DataWorks中建立`PyODPS 3`节点运行FG，节点调度参数中配置好bizdate参数
     ```
-    from pyfg104 import offline_pyfg
+    from pyfg106 import offline_pyfg
     offline_pyfg.run(
       o,
       input_table="YOU_PROJECT.TABLE_NAME",
@@ -302,6 +302,11 @@ pipeline.global-job-parameters: |
 
   ```
 
+- 注意：特征输入中`feature`side的输入(如`feature:xxx`)读到的是被引用特征**Bucketize之后**的值，因此被引用的特征需要满足以下条件之一，否则`--remove_bucketizer`会改变离线FG的计算结果，`create_fg_json`时会报错
+
+  - 被引用的特征配置`stub_type: true`，即该特征只作为FG DAG的中间结果，不输出到表中。`--remove_bucketizer`会保留`stub_type: true`特征的Bucketize配置，如果该特征使用了`vocab_file`，该文件同样需要上传至资源中
+  - 被引用的特征不配置Bucketize参数，如果模型需要Bucketize后的该特征，可以另外增加一个带Bucketize配置的特征来引用它
+
 ### fg_threads
 
 - 每个dataloader worker上fg的运行线程数，默认为1，`nproc-per-node * num_workers * fg_threads`建议小于单机CPU核数
@@ -314,6 +319,9 @@ pipeline.global-job-parameters: |
     label_fields: "click"
     label_fields: "buy"
   ```
+
+- label列的类型是数组时（例如上游表的类型为`array<bigint>`），会被解析成jagged label，
+  取其中的values后和普通label一样使用，无需额外配置
 
 ### sample_weight_fields
 
@@ -334,6 +342,12 @@ pipeline.global-job-parameters: |
 
 - 每个`proc`上的读数据并发度，`nproc-per-node * num_workers`建议小于单机CPU核数
 - 如果`num_workers==0`，数据进程和训练进程将会在一个进程中，便于调试
+
+### in_order
+
+- 是否按dataloader任务提交顺序返回batch，默认为true；仅在`num_workers > 0`时生效
+- 设置为false时，先处理完的worker可以先返回batch，避免慢worker阻塞其他worker，但可能降低可复现性，并改变训练样本或预测结果的输出顺序
+- 对于样本分布不均衡的数据，设置为false可能使训练过程看到的数据分布产生偏差
 
 ### shuffle
 

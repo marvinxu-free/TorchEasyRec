@@ -18,7 +18,8 @@ import re
 import shutil
 from collections import OrderedDict, defaultdict
 from queue import Queue
-from typing import Any, Dict, List, Optional, Set, Tuple, cast
+from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import numpy as np
 import torch
@@ -28,7 +29,9 @@ from torch import distributed as dist
 from torch import nn
 from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.distributed._tensor import DTensor
-from torchrec import KeyedTensor
+from torch.fx import Interpreter
+from torch.fx.node import Target
+from torchrec import JaggedTensor, KeyedTensor
 from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.train_pipeline.utils import Tracer
 from torchrec.inference.modules import quantize_embeddings
@@ -38,7 +41,9 @@ from torchrec.modules.embedding_modules import (
     EmbeddingBagCollectionInterface,
     EmbeddingCollection,
     EmbeddingCollectionInterface,
+    get_embedding_names_by_table,
 )
+from torchrec.modules.mc_modules import MCHManagedCollisionModule
 from torchrec.quant.embedding_modules import (
     EmbeddingCollection as QuantEmbeddingCollection,
 )
@@ -51,6 +56,7 @@ from tzrec.acc import utils as acc_utils
 from tzrec.acc.aot_utils import export_model_aot, export_unified_model_aot
 from tzrec.acc.trt_utils import export_model_trt
 from tzrec.constant import TARGET_REPEAT_INTERLEAVE_KEY, Mode
+from tzrec.datasets.data_parser import _tile_size
 from tzrec.datasets.dataset import (
     create_dataloader,
 )
@@ -62,11 +68,12 @@ from tzrec.features.feature import (
 from tzrec.modules.utils import BaseModule
 from tzrec.protos import model_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.utils import checkpoint_util, config_util, env_util
+from tzrec.utils import checkpoint_util, config_util, env_util, npz_util, quant_util
 from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
 from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.fx_util import (
     fx_mark_keyed_tensor,
+    fx_mark_seq_ec_jt,
     fx_mark_seq_len,
     fx_mark_seq_tensor,
     fx_mark_tensor,
@@ -75,6 +82,50 @@ from tzrec.utils.fx_util import (
 from tzrec.utils.logging_util import logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.utils.state_dict_util import fix_mch_state, init_parameters
+from tzrec.utils.zch_util import iter_zch_tables
+
+
+def ensure_input_tile_for_distributed_embedding() -> None:
+    """Ensure distributed embedding export uses INPUT_TILE=3."""
+    if not acc_utils.use_distributed_embedding():
+        return
+
+    # Distributed embedding export only supports INPUT_TILE=3.
+    # Default to 3 when unset; warn and override if set to anything else.
+    current_input_tile = os.environ.get("INPUT_TILE")
+    if current_input_tile is None:
+        os.environ["INPUT_TILE"] = "3"
+    elif current_input_tile != "3":
+        logger.warning(
+            "USE_DISTRIBUTED_EMBEDDING=1 requires INPUT_TILE=3, "
+            f"got INPUT_TILE={current_input_tile}. Overriding to 3."
+        )
+        os.environ["INPUT_TILE"] = "3"
+
+
+def _is_input_tile_user_keyed_tensor(name: str) -> bool:
+    """Whether a split KeyedTensor is the INPUT_TILE=3 user sparse side."""
+    return name.endswith("__ebc_user") or name.endswith("__mc_ebc_user")
+
+
+def _dedup_key_files_by_realpath(key_files: List[str]) -> List[str]:
+    """Keep one dynamicemb key shard path for each physical file.
+
+    Normal training checkpoints do not create INPUT_TILE user-side dynamicemb
+    aliases, but externally staged checkpoints may contain symlinked or aliased
+    table directories. Since export discovers dynamicemb shards by globbing the
+    checkpoint directory, loading the same physical shard twice would duplicate
+    its keys and values in the exported dynamic embedding data.
+    """
+    seen_real: Set[str] = set()
+    deduped_key_files = []
+    for key_file in key_files:
+        real = os.path.realpath(key_file)
+        if real in seen_real:
+            continue
+        seen_real.add(real)
+        deduped_key_files.append(key_file)
+    return deduped_key_files
 
 
 def export_model(
@@ -83,7 +134,7 @@ def export_model(
     checkpoint_path: Optional[str],
     save_dir: str,
     assets: Optional[List[str]] = None,
-    additional_export_config: Optional[Dict[str, str]] = None,
+    additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
     data_input_path: Optional[str] = None,
 ) -> None:
     """Export a EasyRec model, may be a part of model in PipelineConfig.
@@ -91,9 +142,23 @@ def export_model(
     `data_input_path` (optional): override for the predict-mode dataloader
     input path; falls back to `pipeline_config.train_input_path` when None.
     """
-    use_rtp = env_util.use_rtp()
+    model_type = pipeline_config.model_config.WhichOneof("model")
+    if model_type in ("dlrm_hstu", "ultra_hstu") and (
+        not additional_export_config or "cand_seq_pk" not in additional_export_config
+    ):
+        raise ValueError(
+            "additional_export_config must contain cand_seq_pk when exporting "
+            f"{model_type}."
+        )
 
-    impl = export_rtp_model if use_rtp else export_model_normal
+    use_rtp = env_util.use_rtp()
+    use_dist_embedding = acc_utils.use_distributed_embedding()
+    if use_rtp:
+        impl = export_rtp_model
+    elif use_dist_embedding:
+        impl = export_distributed_embedding
+    else:
+        impl = export_model_normal
     fs, local_path = url_to_fs(save_dir)
     use_local_cache_dir = False
     if fs is not None:
@@ -137,7 +202,7 @@ def _move_quantized_modules_to_device(model: nn.Module, device: torch.device) ->
     for m in model.modules():
         if not hasattr(m, "_emb_modules"):
             continue
-        for emb in m._emb_modules:
+        for emb in cast(List[nn.Module], m._emb_modules):
             if (
                 isinstance(emb, IntNBitTableBatchedEmbeddingBagsCodegen)
                 and emb.current_device != device
@@ -151,7 +216,7 @@ def export_model_normal(
     checkpoint_path: Optional[str],
     save_dir: str,
     assets: Optional[List[str]] = None,
-    additional_export_config: Optional[Dict[str, str]] = None,
+    additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
     data_input_path: Optional[str] = None,
     **kwargs: Any,
 ) -> None:
@@ -176,25 +241,15 @@ def export_model_normal(
     if acc_utils.is_cuda_export():
         # export batch_size too large may OOM in compile phase
         max_batch_size = acc_utils.get_max_export_batch_size()
-        data_config.batch_size = min(data_config.batch_size, max_batch_size)
-        logger.info("using new batch_size: %s in export", data_config.batch_size)
+        inference_batch_size = config_util.get_inference_batch_size(data_config)
+        inference_batch_size = min(inference_batch_size, max_batch_size)
+        config_util.set_inference_batch_size(data_config, inference_batch_size)
+        logger.info("using new batch_size: %s in export", inference_batch_size)
     data_config.num_workers = 1
     input_path = data_input_path or pipeline_config.train_input_path
     dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
 
-    ckpt_param_map_path = None
-    if checkpoint_path:
-        if acc_utils.is_input_tile_emb():
-            # generate embedding name mapping file
-            ckpt_param_map_path = os.path.join(save_dir, "emb_ckpt_mapping.txt")
-            if is_rank_zero:
-                if not os.path.exists(save_dir):
-                    os.makedirs(save_dir)
-                acc_utils.write_mapping_file_for_input_tile(
-                    model.state_dict(), ckpt_param_map_path
-                )
-                dist.barrier()
-    else:
+    if not checkpoint_path:
         raise ValueError("checkpoint path should be specified.")
 
     if is_rank_zero:
@@ -202,12 +257,17 @@ def export_model_normal(
             os.makedirs(save_dir)
         init_parameters(model, torch.device("cpu"))
         checkpoint_util.restore_model(
-            checkpoint_path, model, ckpt_param_map_path=ckpt_param_map_path
+            checkpoint_path,
+            model,
+            use_dense_ema=config_util.use_dense_ema(
+                pipeline_config.export_config,
+                pipeline_config.train_config,
+            ),
         )
         # for mc modules, fix output_segments_tensor is a meta tensor.
         fix_mch_state(model)
 
-        batch = next(iter(dataloader))
+        batch = next(dataloader.get_iterator())  # pyre-ignore[16]
 
         # Quantize on CPU before moving to CUDA. The fbgemm CUDA kernel
         # for nbit quantization uses int32 pointer arithmetic which
@@ -317,6 +377,36 @@ def export_model_normal(
                 shutil.copy(asset, save_dir)
 
 
+def _prepare_single_rank_distributed_embedding_export() -> bool:
+    """Force distributed-embedding export to run as a single rank."""
+    rank = int(os.environ.get("RANK", 0))
+    if rank != 0:
+        logger.warning(
+            "Only first rank will be used for distributed embedding export now."
+        )
+        return False
+
+    forced_env = {
+        "RANK": "0",
+        "LOCAL_RANK": "0",
+        "WORLD_SIZE": "1",
+        "LOCAL_WORLD_SIZE": "1",
+    }
+    changed = [
+        f"{key}={value}"
+        for key, value in forced_env.items()
+        if os.environ.get(key) != value
+    ]
+    if changed:
+        logger.warning(
+            "distributed embedding export only supports single-rank export now, "
+            "we set %s.",
+            ", ".join(changed),
+        )
+    os.environ.update(forced_env)
+    return True
+
+
 def _get_sharded_leaf_module_names(model: torch.nn.Module) -> List[str]:
     """Get ShardedModule as leaf modules."""
 
@@ -324,7 +414,7 @@ def _get_sharded_leaf_module_names(model: torch.nn.Module) -> List[str]:
         model: torch.nn.Module,
         path: str,
         leaf_module_names: Set[str],
-    ) -> bool:
+    ) -> None:
         if isinstance(model, ShardedModule):
             leaf_module_names.add(path)
         else:
@@ -364,10 +454,260 @@ def _get_dense_embedding_leaf_module_names(model: torch.nn.Module) -> List[str]:
     return names
 
 
+def _get_sparse_embedding_leaf_module_names(model: torch.nn.Module) -> List[str]:
+    """Get sparse embedding modules to keep as FX leaf modules during export."""
+    names = []
+    for path, module in model.named_modules():
+        if isinstance(
+            module,
+            (EmbeddingBagCollectionInterface, EmbeddingCollectionInterface),
+        ):
+            names.append(path)
+    return names
+
+
+def _resolve_keyed_tensor_source_module(
+    model: torch.nn.Module, node: Any
+) -> Optional[torch.nn.Module]:
+    """Resolve the module producing a KeyedTensor FX node."""
+    if getattr(node, "op", None) == "call_module":
+        return model.get_submodule(node.target)
+    if getattr(node, "op", None) == "call_function":
+        if node.target == operator.getitem:
+            return _resolve_keyed_tensor_source_module(model, node.args[0])
+        if node.target == KeyedTensor:
+            for attr_name in ("keys", "length_per_key", "values"):
+                attr_node = node.kwargs.get(attr_name)
+                source_module = _resolve_keyed_tensor_source_module(model, attr_node)
+                if source_module is not None:
+                    return source_module
+    if getattr(node, "op", None) == "call_method" and node.target in (
+        "keys",
+        "length_per_key",
+        "values",
+        "tile",
+    ):
+        return _resolve_keyed_tensor_source_module(model, node.args[0])
+    return None
+
+
+def _get_embedding_bag_configs(module: torch.nn.Module) -> Optional[List[Any]]:
+    """Get EmbeddingBag configs from EBC or MC_EBC modules by duck typing.
+
+    Handles unsharded and sharded modules: torchrec's
+    ``ShardedEmbeddingBagCollection`` keeps the original-order configs only in
+    the private ``_embedding_bag_configs`` attribute, and (sharded) MC-EBC
+    modules nest their embedding module under ``_embedding_module``.
+    """
+    if hasattr(module, "embedding_bag_configs"):
+        return list(module.embedding_bag_configs())
+    configs = getattr(module, "_embedding_bag_configs", None)
+    if configs is not None:
+        return list(configs)
+    inner = getattr(module, "_embedding_module", None)
+    if inner is not None:
+        return _get_embedding_bag_configs(inner)
+    return None
+
+
+def _infer_keyed_tensor_attrs_from_module(
+    module: torch.nn.Module,
+) -> Optional[Tuple[List[str], List[int]]]:
+    """Infer KeyedTensor keys/length_per_key from embedding module configs.
+
+    Derives attrs exactly as torchrec's ``EmbeddingBagCollection`` does: one
+    key per feature name (shared features get an ``@table`` suffix) with one
+    ``length_per_key`` entry per key, so the reconstructed KeyedTensor matches
+    the module's runtime output and ``regroup_as_dict`` group names.
+    """
+    configs = _get_embedding_bag_configs(module)
+    if configs is None:
+        return None
+
+    keys = []
+    length_per_key = []
+    for config, embedding_names in zip(configs, get_embedding_names_by_table(configs)):
+        keys.extend(embedding_names)
+        length_per_key.extend([config.embedding_dim] * len(embedding_names))
+    return keys, length_per_key
+
+
+def _canonicalize_keyed_tensor_attrs(
+    source_module: Optional[torch.nn.Module],
+    name: str,
+    runtime_keys: List[str],
+    runtime_length_per_key: List[int],
+) -> Tuple[List[str], List[int]]:
+    """Return canonical config-order keys/length_per_key for a marked KeyedTensor.
+
+    A sharded EmbeddingBagCollection emits its output KeyedTensor grouped by
+    sharding type / compute kernel, so the runtime key order depends on the
+    sharding plan (e.g. dynamicemb tables get regrouped to the tail). The
+    exported dense graph and dense_meta.json must instead use the
+    plan-independent config order that the online dense export derives
+    statically, otherwise the serving processor rejects hot dense updates
+    with dense_meta_mismatch.
+
+    Args:
+        source_module: embedding module that produced the KeyedTensor.
+        name: fx-marked KeyedTensor name, for diagnostics.
+        runtime_keys: keys captured from the sharded runtime output.
+        runtime_length_per_key: length_per_key captured from the runtime.
+
+    Returns:
+        Tuple of (keys, length_per_key) in canonical config order.
+
+    Raises:
+        RuntimeError: if static inference is unsupported for the source
+            module, or the inferred attrs disagree with the runtime output.
+    """
+    inferred = (
+        _infer_keyed_tensor_attrs_from_module(source_module)
+        if source_module is not None
+        else None
+    )
+    if inferred is None:
+        raise RuntimeError(
+            f"cannot statically infer KeyedTensor attrs for [{name}]; the "
+            "dense export must not bake the plan-dependent sharded runtime "
+            "key order, which would mismatch the online dense export."
+        )
+    keys, length_per_key = inferred
+    if sorted(zip(keys, length_per_key)) != sorted(
+        zip(runtime_keys, runtime_length_per_key)
+    ):
+        raise RuntimeError(
+            f"statically inferred KeyedTensor attrs for [{name}] disagree with "
+            f"the runtime output: inferred={list(zip(keys, length_per_key))} "
+            f"runtime={list(zip(runtime_keys, runtime_length_per_key))}"
+        )
+    return keys, length_per_key
+
+
+def _permute_keyed_tensor_values(
+    values: torch.Tensor,
+    src_keys: List[str],
+    src_length_per_key: List[int],
+    dst_keys: List[str],
+) -> torch.Tensor:
+    """Reorder pooled KeyedTensor values along dim 1 from src to dst key order."""
+    chunks = dict(zip(src_keys, torch.split(values, src_length_per_key, dim=1)))
+    return torch.cat([chunks[k] for k in dst_keys], dim=1)
+
+
+def _rewrite_dense_serving_graph(
+    full_graph: torch.fx.Graph,
+    root: torch.nn.Module,
+    sparse_attrs: Dict[str, Any],
+    device: torch.device,
+) -> Tuple[torch.fx.GraphModule, Dict[str, Any]]:
+    """Rewrite a traced full graph into the serving-style dense graph module.
+
+    Replaces every fx-marked sparse KeyedTensor / sequence JaggedTensor with a
+    reconstruction from serving-fed input placeholders using the provided
+    keys/length_per_key attrs, prunes the now-unused embedding parameters, and
+    freshly initializes the module on ``device``; the caller loads the real
+    weights. Shared by the distributed-embedding export and the CPU dense
+    export so their dense graphs and dense_meta cannot drift apart.
+
+    Args:
+        full_graph: pre-surgery traced graph; deep-copied, not modified.
+        root: module owning the traced submodules and parameters.
+        sparse_attrs: ``<name>__keys`` / ``<name>__length_per_key`` attrs to
+            bake into the reconstructed KeyedTensor per marked name.
+        device: device the rewritten graph module lives on.
+
+    Returns:
+        Tuple of (gm, dense_graph_config): the rewritten dense graph module
+        and the dense_meta config mapping placeholder names to serving
+        embedding names.
+    """
+    graph = copy.deepcopy(full_graph)
+    output_keys = []
+    output_values = []
+    dense_graph_config = defaultdict()
+    for node in graph.nodes:
+        if node.op == "output":
+            for k, v in sorted(node.args[0].items()):
+                if k == TARGET_REPEAT_INTERLEAVE_KEY:
+                    continue
+                output_keys.append(k)
+                output_values.append(v)
+            graph.erase_node(node)
+    input_node = next(node for node in graph.nodes if node.op == "placeholder")
+
+    dense_graph_config["sequence__ec"] = []
+    for node in list(graph.nodes):
+        if node.op == "call_function" and node.target == fx_mark_keyed_tensor:
+            name = cast(str, node.args[0])
+            if node.kwargs.get("is_dense", False):
+                continue
+            node_kt = node.args[1]
+            with graph.inserting_before(node_kt):
+                getitem_node = graph.call_function(
+                    operator.getitem, args=(input_node, name)
+                )
+                values_node = getitem_node
+                if _is_input_tile_user_keyed_tensor(name):
+                    batch_size_node = graph.call_function(
+                        operator.getitem, args=(input_node, "batch_size")
+                    )
+                    tile_size_node = graph.call_function(
+                        _tile_size, args=(batch_size_node,)
+                    )
+                    values_node = graph.call_method(
+                        "tile", args=(getitem_node, tile_size_node, 1)
+                    )
+                new_node = graph.call_function(
+                    KeyedTensor,
+                    kwargs={
+                        "keys": sparse_attrs[name + "__keys"],
+                        "length_per_key": sparse_attrs[name + "__length_per_key"],
+                        "values": values_node,
+                    },
+                )
+                dense_graph_config[name] = [
+                    k + "__ebc" for k in cast(List[str], new_node.kwargs["keys"])
+                ]
+                node_kt.replace_all_uses_with(new_node)
+        elif node.op == "call_function" and node.target == fx_mark_seq_ec_jt:
+            name = node.args[0]
+            node_jt = node.args[1]
+            with graph.inserting_before(node_jt):
+                getitem_node = graph.call_function(
+                    operator.getitem, args=(input_node, name)
+                )
+                getitem_lengths = graph.call_function(
+                    operator.getitem, args=(input_node, name + "__lengths")
+                )
+                new_node = graph.call_function(
+                    JaggedTensor,
+                    kwargs={"values": getitem_node, "lengths": getitem_lengths},
+                )
+            node_jt.replace_all_uses_with(new_node)
+            emb_name = name + "__ec"
+            dense_graph_config["sequence__ec"].append(emb_name)
+            dense_graph_config["sequence__ec"].append(name + "__lengths")
+
+    graph.output(dict(zip(output_keys, output_values)))
+    gm = torch.fx.GraphModule(root, graph)
+    _eliminate_dense_dead_code(gm.graph)
+    gm = _prune_unused_param_and_buffer(gm)
+
+    init_parameters(gm, device)
+    gm.to(device)
+    return gm, dense_graph_config
+
+
+def _is_fx_node(value: Any) -> bool:
+    """Whether value is an FX node from the traced graph."""
+    return getattr(value, "op", None) is not None and hasattr(value, "target")
+
+
 def _get_rtp_feature_to_embedding_info(
     model: nn.Module,
 ) -> Dict[str, BaseEmbeddingConfig]:
-    feature_to_embedding_info = dict()
+    feature_to_embedding_info: Dict[str, BaseEmbeddingConfig] = dict()
     feature_to_module_path = dict()
     emb_name_to_module_path = dict()
     q = Queue()
@@ -421,6 +761,24 @@ def _add_module_by_dotted_path(
             parent.add_module(p, nn.Module())  # create empty container
         parent = getattr(parent, p)
     parent.add_module(parts[-1], module)
+
+
+def _eliminate_dense_dead_code(graph: torch.fx.Graph) -> None:
+    """Drop every node the dense graph's output does not depend on.
+
+    A dense graph is a pruned view of the full traced graph: the marked sparse
+    outputs are rewired to read the sparse model's output dict, which leaves the
+    original lookup subtree unreachable. Plain ``eliminate_dead_code`` no longer
+    removes it, because torch>=2.13 resolves an ``OpOverloadPacket`` target to
+    its default overload when deciding purity, so the zero-user
+    ``fbgemm.bounds_check_indices`` left behind by a quantized lookup now counts
+    as impure and pins the whole subtree -- which then reads raw feature keys
+    that exist only in the sparse model's input. The sparse half runs in the
+    sparse model, so here only placeholders and the output are anchors.
+    """
+    graph.eliminate_dead_code(
+        is_impure_node=lambda node: node.op in ("placeholder", "output")
+    )
 
 
 def _prune_unused_param_and_buffer(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
@@ -507,6 +865,7 @@ def _get_rtp_embedding_tensor(
         key_files = sorted(
             glob.glob(os.path.join(dynamicemb_path, "*/*_emb_keys.rank_*.world_size_*"))
         )
+        key_files = _dedup_key_files_by_realpath(key_files)
         key_pattern = re.compile(
             r"^(?P<emb_name>.+)_emb_keys\.rank_(?P<idx>\d+)\.world_size_(?P<num_shards>\d+)$"
         )
@@ -525,7 +884,7 @@ def _get_rtp_embedding_tensor(
                     )
                 with open(
                     os.path.join(
-                        *path_parts[:-1],
+                        os.path.dirname(key_file),
                         f"{emb_name}_emb_values.rank_{idx}.world_size_{num_shards}",
                     ),
                     "rb",
@@ -749,10 +1108,12 @@ def export_rtp_model(
     data_config = copy.deepcopy(pipeline_config.data_config)
     features = cast(List[BaseFeature], model.features)
     data_config.num_workers = 1
-    data_config.batch_size = acc_utils.get_max_export_batch_size()
+    config_util.set_inference_batch_size(
+        data_config, acc_utils.get_max_export_batch_size()
+    )
     input_path = data_input_path or pipeline_config.train_input_path
     dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
-    batch = next(iter(dataloader))
+    batch = next(dataloader.get_iterator())  # pyre-ignore[16]
     data = batch.to(device).to_dict(sparse_dtype=torch.int64)
 
     # Build Sharded Model
@@ -986,7 +1347,7 @@ def export_rtp_model(
                 )
                 with graph.inserting_before(node):
                     new_node = graph.call_function(
-                        FBGEMM_RTP_TORCH_OP_MAPPING[node.target],
+                        FBGEMM_RTP_TORCH_OP_MAPPING[cast(Any, node.target)],
                         args=node.args,
                         kwargs=node.kwargs,
                     )
@@ -995,11 +1356,18 @@ def export_rtp_model(
                 raise RuntimeError(f"{node.target} op is not supported by rtp")
     graph.output(tuple(output_values))
     gm = torch.fx.GraphModule(unwrap_model, graph)
-    gm.graph.eliminate_dead_code()
+    _eliminate_dense_dead_code(gm.graph)
     gm = _prune_unused_param_and_buffer(gm)
     init_parameters(gm, device)
     gm.to(device)
-    checkpoint_util.restore_model(checkpoint_path, gm)
+    checkpoint_util.restore_model(
+        checkpoint_path,
+        gm,
+        use_dense_ema=config_util.use_dense_ema(
+            pipeline_config.export_config,
+            pipeline_config.train_config,
+        ),
+    )
 
     if is_rank_zero:
         with open(os.path.join(graph_dir, "gm_dense.graph"), "w") as f:
@@ -1191,7 +1559,7 @@ def split_model(
 
             node_t.replace_all_uses_with(get_node)
     dense_gm = torch.fx.GraphModule(model, graph)
-    dense_gm.graph.eliminate_dead_code()
+    _eliminate_dense_dead_code(dense_gm.graph)
     dense_gm = _prune_unused_param_and_buffer(dense_gm)
 
     seq_share_groups = _compute_seq_share_groups(
@@ -1204,3 +1572,1300 @@ def split_model(
         "seq_share_groups": seq_share_groups,
     }
     return sparse_gm, dense_gm, meta_info
+
+
+def export_distributed_embedding(
+    pipeline_config: EasyRecConfig,
+    model: BaseModule,
+    checkpoint_path: Optional[str],
+    save_dir: str,
+    assets: Optional[List[str]] = None,
+    use_local_cache_dir: bool = False,
+    additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
+    data_input_path: Optional[str] = None,
+    **kwargs: Any,
+) -> None:
+    """Export for online serving under distributed embedding mode."""
+    if not _prepare_single_rank_distributed_embedding_export():
+        return
+
+    device, _ = init_process_group()
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    is_rank_zero = rank == 0
+    graph_dir = os.path.join(save_dir, "graph")
+    if is_rank_zero:
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+        if not os.path.exists(graph_dir):
+            os.makedirs(graph_dir)
+
+    if not checkpoint_path:
+        raise ValueError("checkpoint path should be specified.")
+
+    sparse_quant_format = acc_utils.distributed_sparse_quant_format()
+    if sparse_quant_format:
+        logger.info(f"distributed sparse quant export enabled: {sparse_quant_format}")
+
+    table_to_embedding_bag_info, table_to_embedding_info = (
+        _get_sparse_table_to_embedding_info(model)
+    )
+
+    # make dataparser to get user feats before create model
+    data_config = copy.deepcopy(pipeline_config.data_config)
+    features = cast(List[BaseFeature], model.features)
+    data_config.num_workers = 1
+    input_path = data_input_path or pipeline_config.train_input_path
+    dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
+    batch = next(iter(dataloader))
+    data = batch.to(device).to_dict(sparse_dtype=torch.int64)
+
+    train_config = pipeline_config.train_config
+
+    model.set_is_inference(True)
+
+    # Build Sharded Model
+    planner = create_planner(
+        device=device,
+        # pyre-ignore [16]
+        batch_size=dataloader.dataset.sampled_batch_size,
+        ckpt_plan_path=os.path.join(checkpoint_path, "plan")
+        if checkpoint_path
+        else None,
+        global_constraints_cfg=train_config.global_embedding_constraints
+        if train_config.HasField("global_embedding_constraints")
+        else None,
+        model=model,
+    )
+    sharders = get_default_sharders()
+    plan = planner.collective_plan(model, sharders, dist.GroupMember.WORLD)
+    dmp_model = DistributedModelParallel(
+        module=model,
+        sharders=sharders,
+        device=device,
+        plan=plan,
+        init_parameters=True,
+        init_data_parallel=False,
+    )
+    dmp_model.eval()
+
+    # Materialize lazy modules before FX tracing. Some modules build submodules
+    # from concrete tensor shapes on their first forward; during FX trace those
+    # shapes become Proxy objects and cannot be used to construct Parameters.
+    #
+    # Keep the existing sparse/dense GraphModule restore steps below as the
+    # final source of exported weights. This warm-up is only to make the module
+    # structure traceable.
+    logger.info("running pre-trace warm-up for distributed embedding export...")
+    checkpoint_util.restore_model(checkpoint_path, dmp_model)
+    dmp_model.to(device)
+    with torch.no_grad():
+        warmup_result = dmp_model(data, device=device)
+    del warmup_result
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    unwrap_model = dmp_model.module
+    tracer = Tracer(leaf_modules=_get_sharded_leaf_module_names(unwrap_model))
+    full_graph = tracer.trace(unwrap_model)
+
+    if is_rank_zero:
+        with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
+            f.write(str(full_graph))
+
+    # Extract Sparse Model
+    logger.info("exporting sparse model...")
+    graph = copy.deepcopy(full_graph)
+    for node in graph.nodes:
+        if node.op == "output":
+            graph.erase_node(node)
+    outputs = {}
+    output_attrs = {}
+    for node in list(graph.nodes):
+        if node.op == "call_function" and node.target == fx_mark_keyed_tensor:
+            name = node.args[0]
+            if node.kwargs.get("is_dense", False):
+                continue
+            node_kt = node.args[1]
+            with graph.inserting_after(node_kt):
+                kt_values = node_kt.kwargs.get("values")
+                if (
+                    _is_input_tile_user_keyed_tensor(name)
+                    and getattr(kt_values, "op", None) == "call_method"
+                    and kt_values.target == "tile"
+                ):
+                    # Serving supplies raw user-side embedding values with batch=1.
+                    # Keep sparse output raw as well; the dense model owns tiling.
+                    outputs[name] = kt_values.args[0]
+                    output_attrs[name + "__length_per_key"] = node_kt.kwargs[
+                        "length_per_key"
+                    ]
+                    output_attrs[name + "__keys"] = node_kt.kwargs["keys"]
+                else:
+                    outputs[name] = graph.call_method("values", args=(node_kt,))
+                    output_attrs[name + "__length_per_key"] = graph.call_method(
+                        "length_per_key", args=(node_kt,)
+                    )
+                    output_attrs[name + "__keys"] = graph.call_method(
+                        "keys", args=(node_kt,)
+                    )
+        elif node.op == "call_function" and node.target == fx_mark_seq_ec_jt:
+            name = node.args[0]
+            node_jt = node.args[1]
+            with graph.inserting_after(node_jt):
+                outputs[name] = graph.call_method("values", args=(node_jt,))
+                outputs[name + "__lengths"] = graph.call_method(
+                    "lengths", args=(node_jt,)
+                )
+                output_attrs[name + "__lengths"] = graph.call_method(
+                    "lengths", args=(node_jt,)
+                )
+
+    graph.output(tuple([outputs, output_attrs]))
+    sparse_gm = torch.fx.GraphModule(unwrap_model, graph)
+    sparse_gm.graph.eliminate_dead_code()
+    sparse_gm = _prune_unused_param_and_buffer(sparse_gm)
+
+    if is_rank_zero:
+        with open(os.path.join(graph_dir, "gm_sparse.graph"), "w") as f:
+            f.write(str(sparse_gm.graph))
+
+    # `unwrap_model` has already been wrapped by DistributedModelParallel and
+    # restored above. `sparse_gm` shares those sharded embedding modules; wrapping
+    # the extracted sparse graph a second time can leave TorchRec's per-table
+    # feature split state inconsistent for INPUT_TILE user towers.
+    sparse_model = sparse_gm
+    sparse_model.eval()
+    sparse_output, sparse_attrs = sparse_model(data, device=device)
+    # Save Sparse Parameters
+    logger.info("saving sparse parameters...")
+
+    local_tensor, dynamic_local_tensor, emb_meta, feat_meta = (
+        _get_sparse_embedding_tensor(
+            sparse_model,
+            checkpoint_path,
+            table_to_embedding_info,
+            table_to_embedding_bag_info,
+        )
+    )
+    local_tensor_name = f"sparse_embeddings-{rank:02d}-of-{world_size:02d}"
+    save_dir_sparse = f"{save_dir}/sparse"
+    os.makedirs(save_dir_sparse, exist_ok=True)
+    local_tensor_path = os.path.join(save_dir_sparse, f"{local_tensor_name}.npz")
+    logger.info(f"save sparse tensors to {local_tensor_path}")
+    npz_util.savez_streaming(local_tensor_path, local_tensor)
+
+    if dynamic_local_tensor:
+        dynamic_tensor_name = f"sparse_dynamic_embedding-{rank:02d}-of-{world_size:02d}"
+        dynamic_tensor_path = os.path.join(
+            save_dir_sparse, f"{dynamic_tensor_name}.npz"
+        )
+        logger.info(f"save dynamic sparse tensors to {dynamic_tensor_path}")
+        npz_util.savez_streaming(dynamic_tensor_path, dynamic_local_tensor)
+
+    with open(os.path.join(save_dir_sparse, f"{local_tensor_name}.json"), "w") as f:
+        json.dump(emb_meta, f, indent=4)
+    if is_rank_zero:
+        with open(os.path.join(save_dir_sparse, "sparse_features.json"), "w") as f:
+            json.dump(feat_meta, f, indent=4)
+
+    # Extract Dense Model
+    logger.info("exporting dense model...")
+    for node in full_graph.nodes:
+        if node.op != "call_function" or node.target != fx_mark_keyed_tensor:
+            continue
+        name = node.args[0]
+        if node.kwargs.get("is_dense", False):
+            continue
+        runtime_keys = cast(List[str], sparse_attrs[name + "__keys"])
+        runtime_length_per_key = cast(
+            List[int], sparse_attrs[name + "__length_per_key"]
+        )
+        keys, length_per_key = _canonicalize_keyed_tensor_attrs(
+            _resolve_keyed_tensor_source_module(unwrap_model, node.args[1]),
+            name,
+            runtime_keys,
+            runtime_length_per_key,
+        )
+        if keys != runtime_keys:
+            # keep the rank-zero smoke-run inputs aligned with the
+            # canonical layout baked into the dense graph
+            sparse_output[name] = _permute_keyed_tensor_values(
+                sparse_output[name], runtime_keys, runtime_length_per_key, keys
+            )
+        sparse_attrs[name + "__keys"] = keys
+        sparse_attrs[name + "__length_per_key"] = length_per_key
+
+    gm, dense_graph_config = _rewrite_dense_serving_graph(
+        full_graph, unwrap_model, sparse_attrs, device
+    )
+    checkpoint_util.restore_model(
+        checkpoint_path,
+        gm,
+        use_dense_ema=config_util.use_dense_ema(
+            pipeline_config.export_config,
+            pipeline_config.train_config,
+        ),
+    )
+
+    if is_rank_zero:
+        with open(os.path.join(save_dir, "dense_meta.json"), "w") as f:
+            json.dump(dense_graph_config, f, indent=4)
+
+        with open(os.path.join(graph_dir, "gm_dense.graph"), "w") as f:
+            f.write(str(gm.graph))
+        data.update(sparse_output)
+        _ = gm(data, device)
+
+        dense_model_traced = symbolic_trace(gm)
+
+        with open(os.path.join(save_dir, "gm_dense.code"), "w") as f:
+            f.write(dense_model_traced.code)
+
+        dense_model_scripted = torch.jit.script(dense_model_traced)
+        dense_model_scripted.save(os.path.join(save_dir, "scripted_model.pt"))
+
+        logger.info("saving pipeline.config...")
+        feature_configs = create_feature_configs(features, asset_dir=save_dir)
+        pipeline_config = copy.copy(pipeline_config)
+        pipeline_config.ClearField("feature_configs")
+        pipeline_config.feature_configs.extend(feature_configs)
+        config_util.save_message(
+            pipeline_config, os.path.join(save_dir, "pipeline.config")
+        )
+
+        with open(os.path.join(save_dir, "model_acc.json"), "w") as f:
+            json.dump(
+                acc_utils.export_acc_config(
+                    additional_export_config=additional_export_config
+                ),
+                f,
+                indent=4,
+            )
+
+        has_fg_asset = False
+        if assets is not None:
+            for asset in assets:
+                if asset.endswith("fg.json"):
+                    has_fg_asset = True
+                shutil.copy(asset, save_dir)
+
+        # Save FG
+        if not has_fg_asset:
+            logger.info("saving fg json...")
+            fg_json = create_fg_json(features, asset_dir=save_dir)
+            with open(os.path.join(save_dir, "fg.json"), "w") as f:
+                json.dump(fg_json, f, indent=4)
+
+    if is_rank_zero:
+        # merge sharded sparse meta files
+        emb_json_file_names = glob.glob(
+            os.path.join(save_dir_sparse, "sparse_embeddings*.json")
+        )
+        emb_json_files = []
+        for emb_j in emb_json_file_names:
+            with open(f"{emb_j}", "r", encoding="utf-8") as f:
+                data_j = json.load(f)
+                emb_json_files.append(data_j)
+
+        merged_emb_json = _merge_sharded_embedding_json(emb_json_files)
+        with open(os.path.join(save_dir_sparse, "sparse_embedding.json"), "w") as f:
+            json.dump(merged_emb_json, f, indent=4)
+
+
+class _SparseMarkCapture(Interpreter):
+    """FX interpreter that records fx-marked sparse group outputs."""
+
+    def __init__(
+        self,
+        module: torch.nn.Module,
+        sparse_kts: Dict[str, KeyedTensor],
+        seq_jts: Dict[str, JaggedTensor],
+    ) -> None:
+        super().__init__(module)
+        self._sparse_kts = sparse_kts
+        self._seq_jts = seq_jts
+
+    def call_function(
+        self, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any]
+    ) -> Any:
+        """Capture mark arguments, then execute the node as usual."""
+        if target is fx_mark_keyed_tensor and not kwargs.get("is_dense", False):
+            self._sparse_kts[args[0]] = args[1]
+        elif target is fx_mark_seq_ec_jt:
+            self._seq_jts[args[0]] = args[1]
+        return super().call_function(target, args, kwargs)
+
+
+def _run_dense_graph_sanity_check(
+    model: torch.nn.Module,
+    full_graph: torch.fx.Graph,
+    gm: torch.fx.GraphModule,
+    data: Dict[str, torch.Tensor],
+    device: torch.device,
+) -> None:
+    """Run the pre-surgery graph once before scripting.
+
+    Executes the full graph via an Interpreter to validate that the model
+    runs end-to-end on the warm-up batch. The pruned-graph forward is
+    skipped to avoid OOM on large models (see comment below).
+    """
+    sparse_kts: Dict[str, KeyedTensor] = {}
+    seq_jts: Dict[str, JaggedTensor] = {}
+    capture_gm = torch.fx.GraphModule(model, copy.deepcopy(full_graph))
+    with torch.no_grad():
+        _SparseMarkCapture(capture_gm, sparse_kts, seq_jts).run(data, device)
+    # The pruned-graph forward (gm on captured sparse outputs) is skipped:
+    # the captured outputs (~660 MB for large models) are kept alive as the
+    # placeholder value for the entire forward, and the dense-layer
+    # intermediates on top exceed available host memory. The capture
+    # forward above already validated the full graph end-to-end, and
+    # torch.jit.script still validates the pruned graph's structure.
+
+
+def _isolate_kafka_export_group(input_path: str) -> str:
+    """Rewrite a kafka URI's group.id to an export-isolated group.
+
+    The dense export reads one warm-up batch from the input. When that input
+    is the live training Kafka topic, subscribing with the training group.id
+    would join the training consumer group and rebalance it on every export.
+    Swap group.id to an isolated export group so the training group is never
+    disturbed; non-kafka inputs are returned unchanged.
+
+    Args:
+        input_path: Original input path, possibly a kafka:// URI.
+
+    Returns:
+        input_path with the kafka group.id replaced by an isolated export
+        group, or the input unchanged for non-kafka URIs.
+    """
+    parsed = urlparse(input_path)
+    if parsed.scheme != "kafka":
+        return input_path
+    params = dict(parse_qsl(parsed.query))
+    gid = params.get("group.id")
+    if not gid:
+        return input_path
+    params["group.id"] = f"{gid}__dense_export"
+    return urlunparse(parsed._replace(query=urlencode(params)))
+
+
+def create_dense_export_warmup_data(
+    pipeline_config: EasyRecConfig,
+    model: BaseModule,
+    device: torch.device,
+    data_input_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build one warm-up batch for CPU dense export.
+
+    One batch from ``data_input_path`` (or ``pipeline_config.train_input_path``)
+    materializes lazy-module shapes before FX tracing. Its sparse lookup
+    values are zeroed so out-of-range values (e.g. a dynamicemb feature's
+    64-bit FG hash) pass F.embedding_bag's strict CPU range-check -- the
+    dynamicemb backend that would remap them is GPU/DMP-only, and the
+    warm-up's lookup values are discarded anyway (real weights are loaded
+    by the caller before finalizing).
+
+    Args:
+        pipeline_config: pipeline config whose data_config / train_input_path
+            drive the warm-up dataloader.
+        model: model to export; its features feed the dataloader.
+        device: device the batch is moved to.
+        data_input_path: optional warm-up input override; when unset the
+            training input is used with an export-isolated Kafka group.
+
+    Returns:
+        The warm-up batch as a model-input dict.
+    """
+    input_path = data_input_path or pipeline_config.train_input_path
+    if not input_path:
+        raise ValueError("data input path should be specified.")
+    if data_input_path is None:
+        # isolate the export's Kafka group when falling back to train_input_path
+        input_path = _isolate_kafka_export_group(input_path)
+    data_config = copy.deepcopy(pipeline_config.data_config)
+    data_config.num_workers = 1
+    features = cast(List[BaseFeature], model.features)
+    dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
+    batch = next(iter(dataloader))
+    batch = batch.to(device)
+    for kjt in batch.sparse_features.values():
+        kjt.values().zero_()
+    return batch.to_dict(sparse_dtype=torch.int64)
+
+
+def _shrink_sparse_embedding_tables(model: nn.Module) -> None:
+    """Shrink sparse lookup tables to one row in place.
+
+    The dense export never consumes sparse table values: warm-up input ids
+    are zeroed, the sparse lookups are cut out of the traced graph, and
+    their parameters are pruned before the caller loads real weights. But
+    ``init_parameters`` materializes every meta parameter at full shape
+    first, so dynamicemb / zch tables (100M+ rows) -- plus the zch-sized
+    MCH buffers -- can exhaust host memory and get the process OOM-killed
+    before the pruning ever runs.
+
+    Replace each sparse table weight with a same-dtype 1-row parameter
+    and each zch-sized MCH buffer (_mch_sorted_raw_ids,
+    _mch_remapped_ids_mapping and the _mch_<metadata> eviction buffers)
+    with a 1-row buffer. The zeroed warm-up batch looks up only id 0, and
+    it lands on row 0 because _mch_sorted_raw_ids is zeroed (so id 0 hits
+    the match branch at index 0) and _mch_remapped_ids_mapping is zeroed
+    (so the match maps to row 0) -- not merely because zch_size is 1.
+    Non-matching ids fall to _output_global_offset + zch_size - 1, which
+    equals row 0 only because the export twin is unsharded
+    (_output_global_offset == 0); a sharded twin would send them past the
+    single row. Shape matching is avoided: sentinels like _mch_slots and
+    _delimiter are (1,)-shaped but carry zch_size, and
+    _output_segments_tensor is fixed-length 1025.
+
+    Args:
+        model: export-side model, mutated in place before its meta
+            parameters are materialized.
+    """
+    for module in model.modules():
+        if isinstance(module, EmbeddingBagCollection):
+            tables = list(module.embedding_bags.values())
+        elif isinstance(module, EmbeddingCollection):
+            tables = list(module.embeddings.values())
+        else:
+            tables = None
+        if tables is not None:
+            for table in tables:
+                weight = cast(torch.Tensor, table.weight)
+                # zeros, not empty: if the model is already materialized,
+                # init_parameters skips it and uninitialized memory would
+                # flow through the warm-up and sanity forwards.
+                table.weight = nn.Parameter(
+                    torch.zeros(
+                        (1, weight.shape[1]),
+                        dtype=weight.dtype,
+                        device=weight.device,
+                    ),
+                    requires_grad=weight.requires_grad,
+                )
+        elif isinstance(module, MCHManagedCollisionModule):
+            zch_size = module._zch_size
+            if zch_size <= 1:
+                continue
+            module._zch_size = 1
+
+            # Select the zch-sized buffers by name: the shape heuristic
+            # catches the (1,)-shaped _mch_slots sentinel when zch_size==2
+            # and the fixed-length-1025 _output_segments_tensor when
+            # zch_size is 1025/1026. In eval mode only remap() runs, and
+            # with zch_size=1 it maps every id to row 0.
+            def _shrink_buffer(buffer: torch.Tensor) -> torch.Tensor:
+                return torch.zeros(
+                    [1] + list(buffer.shape[1:]),
+                    dtype=buffer.dtype,
+                    device=buffer.device,
+                )
+
+            for name in ["_mch_sorted_raw_ids", "_mch_remapped_ids_mapping"]:
+                module._buffers[name] = _shrink_buffer(module._buffers[name])
+            # _init_metadata_buffers caches a reference to each eviction
+            # buffer in _mch_metadata; refresh it alongside the buffer so
+            # the module state stays self-consistent.
+            for metadata_name in module._mch_metadata:
+                name = f"_mch_{metadata_name}"
+                module._buffers[name] = _shrink_buffer(module._buffers[name])
+                module._mch_metadata[metadata_name] = module._buffers[name]
+
+
+def build_dense_graph_module(
+    model: BaseModule,
+    data: Dict[str, Any],
+    device: torch.device,
+) -> Tuple[torch.fx.GraphModule, torch.fx.Graph, Dict[str, Any]]:
+    """Trace the model and rewrite it into the serving-style dense graph.
+
+    Runs a pre-trace warm-up forward to materialize lazy modules, traces the
+    full graph, rewrites the sparse and sequence embedding lookups into
+    serving-fed input placeholders, and prunes the now-unused embedding
+    parameters. The graph module's parameters are freshly initialized on
+    ``device``; the caller loads the real weights before finalizing.
+
+    Args:
+        model: model to export, switched to inference mode in place.
+        data: warm-up batch dict (see create_dense_export_warmup_data).
+        device: device the traced graph module lives on.
+
+    Returns:
+        Tuple of (gm, full_graph, dense_graph_config): the rewritten dense
+        graph module, the pre-surgery graph (kept for the sanity check), and
+        the dense_meta config mapping placeholder names to serving embedding
+        names.
+    """
+    model.set_is_inference(True)
+    model.eval()
+
+    # Materialize lazy modules before FX tracing. Some modules build
+    # submodules from concrete tensor shapes on their first forward; during
+    # FX trace those shapes become Proxy objects and cannot construct
+    # Parameters.
+    logger.info("running pre-trace warm-up for CPU dense export...")
+    # Shrink sparse tables to 1 row before materialization: their values are
+    # never used by the dense graph (pruned after surgery), and full-size
+    # dynamicemb / zch tables can OOM the host before the pruning runs.
+    _shrink_sparse_embedding_tables(model)
+    # Materialize meta params; real weights are loaded by the caller.
+    init_parameters(model, device)
+    with torch.no_grad():
+        model(data, device=device)
+
+    leaf_modules = _get_sparse_embedding_leaf_module_names(
+        model
+    ) + _get_dense_embedding_leaf_module_names(model)
+    tracer = Tracer(leaf_modules=leaf_modules)
+    full_graph = tracer.trace(model)
+
+    logger.info("collecting sparse attrs statically for CPU dense export...")
+    sparse_attrs = {}
+    for node in list(full_graph.nodes):
+        if node.op != "call_function" or node.target != fx_mark_keyed_tensor:
+            continue
+        name = node.args[0]
+        if node.kwargs.get("is_dense", False):
+            continue
+        node_kt = node.args[1]
+        node_kt_kwargs = getattr(node_kt, "kwargs", {})
+        keys = node_kt_kwargs.get("keys")
+        length_per_key = node_kt_kwargs.get("length_per_key")
+        need_infer_attrs = (
+            keys is None
+            or length_per_key is None
+            or _is_fx_node(keys)
+            or _is_fx_node(length_per_key)
+        )
+        if need_infer_attrs:
+            source_module = _resolve_keyed_tensor_source_module(model, node_kt)
+            inferred_attrs = (
+                _infer_keyed_tensor_attrs_from_module(source_module)
+                if source_module is not None
+                else None
+            )
+            if inferred_attrs is not None:
+                keys, length_per_key = inferred_attrs
+        if (
+            keys is None
+            or length_per_key is None
+            or _is_fx_node(keys)
+            or _is_fx_node(length_per_key)
+        ):
+            raise RuntimeError(
+                "CPU dense export cannot statically infer KeyedTensor attrs "
+                f"for feature group [{name}]."
+            )
+        sparse_attrs[name + "__keys"] = keys
+        sparse_attrs[name + "__length_per_key"] = length_per_key
+
+    logger.info("exporting dense model on CPU...")
+    gm, dense_graph_config = _rewrite_dense_serving_graph(
+        full_graph, model, sparse_attrs, device
+    )
+    return gm, full_graph, dense_graph_config
+
+
+def finalize_dense_export(
+    model: BaseModule,
+    full_graph: torch.fx.Graph,
+    gm: torch.fx.GraphModule,
+    data: Dict[str, Any],
+    device: torch.device,
+    save_dir: str,
+    dense_graph_config: Dict[str, Any],
+    dense_model_traced: Optional[torch.fx.GraphModule] = None,
+) -> torch.fx.GraphModule:
+    """Sanity-check and script a dense graph carrying its final weights.
+
+    Runs the rewritten graph once on serving-style inputs rebuilt from the
+    warm-up batch (so graph surgery or KeyedTensor regroup errors surface at
+    export time instead of at serving time), then writes dense_meta.json,
+    the graph dumps and the scripted model under ``save_dir``.
+
+    FX tracing patches ``torch.nn.Module.__call__`` process-wide for its
+    duration, so it is not safe to run concurrently with eager forwards.
+    Callers that export from a background thread (the online dense export)
+    trace once up front and pass the result via ``dense_model_traced``,
+    reusing it across versions; the traced module shares ``gm``'s parameters,
+    so reloading ``gm``'s weights is reflected without re-tracing. When no
+    traced module is supplied -- the standalone, single-threaded CLI path --
+    it is traced here.
+
+    Args:
+        model: model the dense graph was traced from.
+        full_graph: pre-surgery graph captured by build_dense_graph_module.
+        gm: rewritten dense graph module with final weights loaded.
+        data: warm-up batch dict.
+        device: device of ``gm``.
+        save_dir: directory the export artifacts are written to.
+        dense_graph_config: dense_meta config from build_dense_graph_module.
+        dense_model_traced: pre-traced ``gm`` to script; traced here if None.
+
+    Returns:
+        The traced module that was scripted, so a caller can reuse it across
+        exports without re-tracing.
+    """
+    graph_dir = os.path.join(save_dir, "graph")
+    os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(graph_dir, exist_ok=True)
+
+    _run_dense_graph_sanity_check(model, full_graph, gm, data, device)
+
+    with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
+        f.write(str(full_graph))
+    with open(os.path.join(save_dir, "dense_meta.json"), "w") as f:
+        json.dump(dense_graph_config, f, indent=4)
+    with open(os.path.join(graph_dir, "gm_dense.graph"), "w") as f:
+        f.write(str(gm.graph))
+
+    if dense_model_traced is None:
+        dense_model_traced = symbolic_trace(gm)
+    with open(os.path.join(save_dir, "gm_dense.code"), "w") as f:
+        f.write(dense_model_traced.code)
+    dense_model_scripted = torch.jit.script(dense_model_traced)
+    dense_model_scripted.save(os.path.join(save_dir, "scripted_model.pt"))
+    return dense_model_traced
+
+
+def export_dense_model_cpu(
+    pipeline_config: EasyRecConfig,
+    model: BaseModule,
+    checkpoint_path: Optional[str],
+    save_dir: str,
+    assets: Optional[List[str]] = None,
+    use_local_cache_dir: bool = False,
+    data_input_path: Optional[str] = None,
+    **kwargs: Any,
+) -> None:
+    """Export only the dense model on CPU without DMP or GPU usage.
+
+    One batch from ``data_input_path`` (or ``pipeline_config.train_input_path``)
+    warms up lazy modules before tracing and sanity-runs the rewritten graph
+    before scripting; restore fails on any checkpoint-missing state so the
+    exported model can never carry uninitialized weights.
+    """
+    del assets, use_local_cache_dir, kwargs
+    if not checkpoint_path:
+        raise ValueError("checkpoint path should be specified.")
+
+    device = torch.device("cpu")
+    data = create_dense_export_warmup_data(
+        pipeline_config, model, device, data_input_path
+    )
+    gm, full_graph, dense_graph_config = build_dense_graph_module(model, data, device)
+    checkpoint_util.restore_model(
+        checkpoint_path,
+        gm,
+        error_on_missing_keys=True,
+        use_dense_ema=config_util.use_dense_ema(
+            pipeline_config.export_config,
+            pipeline_config.train_config,
+        ),
+    )
+    finalize_dense_export(
+        model, full_graph, gm, data, device, save_dir, dense_graph_config
+    )
+
+
+def _merge_sharded_embedding_json(
+    emb_json_files: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Merge sharded embedding json files into one."""
+    merged_json = {}
+    for emb_json in emb_json_files:
+        for emb_name, info in emb_json.items():
+            if emb_name not in merged_json:
+                merged_json[emb_name] = copy.deepcopy(info)
+            else:
+                for field in ("dimension", "dtype"):
+                    if merged_json[emb_name].get(field) != info.get(field):
+                        raise ValueError(
+                            f"embedding {emb_name} has inconsistent {field}: "
+                            f"{merged_json[emb_name].get(field)} vs {info.get(field)}"
+                        )
+                if merged_json[emb_name]["shape"][1] != info["shape"][1]:
+                    raise ValueError(
+                        f"embedding {emb_name} has inconsistent shape[1]: "
+                        f"{merged_json[emb_name]['shape'][1]} vs {info['shape'][1]}"
+                    )
+                for field in ("storage_dtype", "row_bytes", "quant"):
+                    if merged_json[emb_name].get(field) != info.get(field):
+                        raise ValueError(
+                            f"embedding {emb_name} has inconsistent {field}: "
+                            f"{merged_json[emb_name].get(field)} vs {info.get(field)}"
+                        )
+                merged_json[emb_name]["memory"] += info["memory"]
+                merged_json[emb_name]["shape"][0] += info["shape"][0]
+                if "storage_shape" in merged_json[emb_name] or "storage_shape" in info:
+                    if (
+                        "storage_shape" not in merged_json[emb_name]
+                        or "storage_shape" not in info
+                    ):
+                        raise ValueError(
+                            f"embedding {emb_name} has inconsistent storage_shape "
+                            "presence across shards"
+                        )
+                    if (
+                        merged_json[emb_name]["storage_shape"][1]
+                        != info["storage_shape"][1]
+                    ):
+                        raise ValueError(
+                            f"embedding {emb_name} has inconsistent storage_shape[1]: "
+                            f"{merged_json[emb_name]['storage_shape'][1]} vs "
+                            f"{info['storage_shape'][1]}"
+                        )
+                    merged_json[emb_name]["storage_shape"][0] += info["storage_shape"][
+                        0
+                    ]
+                if info.get("is_dynamic"):
+                    # Dynamic npz entry names are uniform across ranks
+                    # (e.g. always "user_id_emb.keys"). Serving iterates all
+                    # sparse_dynamic_embedding-*.npz files with the same entry
+                    # names, so keep the single key/value/score entry names.
+                    for field in (
+                        "key_name",
+                        "value_name",
+                        "score_name",
+                        "default_value_name",
+                    ):
+                        if merged_json[emb_name].get(field) != info.get(field):
+                            raise ValueError(
+                                f"dynamic embedding {emb_name} has inconsistent "
+                                f"{field}: {merged_json[emb_name].get(field)} vs "
+                                f"{info.get(field)}"
+                            )
+                    if merged_json[emb_name].get("score_dtype") != info.get(
+                        "score_dtype"
+                    ):
+                        raise ValueError(
+                            f"dynamic embedding {emb_name} has inconsistent "
+                            f"score_dtype: {merged_json[emb_name].get('score_dtype')} "
+                            f"vs {info.get('score_dtype')}"
+                        )
+
+    return merged_json
+
+
+def _get_sparse_table_to_embedding_info(
+    model: nn.Module,
+) -> Tuple[Dict[str, BaseEmbeddingConfig], Dict[str, BaseEmbeddingConfig]]:
+    """Collect sparse embedding configs keyed by state-dict-style table FQN."""
+    table_to_embedding_bag_info: Dict[str, BaseEmbeddingConfig] = dict()
+    table_to_embedding_info: Dict[str, BaseEmbeddingConfig] = dict()
+    q = Queue()
+    q.put(("", model))
+    while not q.empty():
+        child_path, m = q.get()
+        if isinstance(m, EmbeddingBagCollectionInterface):
+            embedding_configs = m.embedding_bag_configs()
+            for t in embedding_configs:
+                table_fqn = ".".join(
+                    filter(None, (child_path, "embedding_bags", t.name))
+                )
+                table_to_embedding_bag_info[table_fqn] = t
+
+        elif isinstance(m, EmbeddingCollectionInterface):
+            embedding_configs = m.embedding_configs()
+            for t in embedding_configs:
+                table_fqn = ".".join(filter(None, (child_path, "embeddings", t.name)))
+                table_to_embedding_info[table_fqn] = t
+        else:
+            for name, child in m.named_children():
+                if child_path == "":
+                    q.put((name, child))
+                else:
+                    q.put((f"{child_path}.{name}", child))
+
+    return table_to_embedding_bag_info, table_to_embedding_info
+
+
+def _dynamic_sparse_module_fqn(dynamicemb_path: str, key_file: str) -> str:
+    """Build a normalized module FQN from a dynamic checkpoint shard path."""
+    module_fqn = os.path.relpath(os.path.dirname(key_file), dynamicemb_path).replace(
+        os.path.sep, "."
+    )
+    if module_fqn.startswith("model.model."):
+        module_fqn = module_fqn[len("model.") :]
+    return module_fqn
+
+
+def _remove_torch_prefix(src: str) -> str:
+    prefix = "torch."
+    if src.startswith(prefix):
+        return src[len(prefix) :]
+    return src
+
+
+def _value_nbytes(values: Any) -> int:
+    if hasattr(values, "nbytes"):
+        return int(values.nbytes)
+    return int(values.numel() * values.element_size())
+
+
+def _prepare_sparse_export_values(
+    values: Any, emb_dim: int, emb_name: str
+) -> Tuple[Any, Dict[str, Any]]:
+    shape = list(values.shape)
+    if len(shape) != 2 or shape[1] != emb_dim:
+        raise ValueError(
+            f"Expected a 2D sparse embedding tensor with dim={emb_dim}, "
+            f"got shape={shape}"
+        )
+
+    quant_format = acc_utils.distributed_sparse_quant_format()
+    if not quant_format:
+        return values, {
+            "dimension": emb_dim,
+            "dtype": _remove_torch_prefix(str(values.dtype)),
+            "memory": _value_nbytes(values),
+            "shape": shape,
+        }
+
+    quantized_values = quant_util.distributed_quantize_embeddings(
+        values,
+        emb_dim=emb_dim,
+        emb_name=emb_name,
+        quant_format=quant_format,
+    )
+    return quantized_values, {
+        "dimension": emb_dim,
+        "dtype": quant_format,
+        "storage_dtype": quant_util._DISTRIBUTED_SPARSE_QUANT_STORAGE_DTYPE,
+        "storage_shape": list(quantized_values.shape),
+        "row_bytes": int(quantized_values.shape[1]),
+        "memory": int(quantized_values.nbytes),
+        "shape": shape,
+        "quant": {
+            "enabled": True,
+            "format": quant_format,
+            "scale_offset_dtype": "float16",
+            "output_dtype": "float16",
+        },
+    }
+
+
+def _get_zch_export_tables(
+    model: nn.Module, emb_name_to_emb_dim: Dict[str, int]
+) -> Dict[str, MCHManagedCollisionModule]:
+    """Collect ZCH modules keyed by the export name of the table they remap.
+
+    Args:
+        model: model to walk, sharded or not.
+        emb_name_to_emb_dim: export name to dim of all sparse tables.
+
+    Returns:
+        Dict {export table name -> ZCH module}.
+    """
+    zch_tables: Dict[str, MCHManagedCollisionModule] = {}
+    for zch_table in iter_zch_tables(model):
+        mch = zch_table.mc_module
+        if not isinstance(mch, MCHManagedCollisionModule):
+            raise ValueError(
+                f"unsupported managed collision module {type(mch).__name__} of "
+                f"table {zch_table.table_name} in {zch_table.wrapper_fqn}."
+            )
+        export_emb_name = checkpoint_util.remap_input_tile_user_key(zch_table.table_fqn)
+        if export_emb_name not in emb_name_to_emb_dim:
+            raise ValueError(
+                f"zch table {zch_table.table_name} in {zch_table.wrapper_fqn} has "
+                f"no matching sparse embedding config, tried {export_emb_name}."
+            )
+        zch_tables[export_emb_name] = mch
+    return zch_tables
+
+
+def _zch_table_to_dynamic(
+    mch: MCHManagedCollisionModule,
+    weight: torch.Tensor,
+    shard_offset: int,
+    emb_name: str,
+) -> Tuple[torch.Tensor, np.ndarray, torch.Tensor, np.ndarray]:
+    """Materialize the raw id to embedding binding of one ZCH table shard.
+
+    ZCH remaps raw feature ids to compact table rows inside the model, but
+    serving looks embeddings up by raw id, so a ZCH table is exported as a
+    dynamic table whose keys are the raw ids kept by the ZCH module.
+
+    ZCH reserves its last row as the embedding of every id it does not hold, and
+    that row is trained on all such ids, so it is exported as the default value
+    of the dynamic table instead of being dropped with the unused rows.
+
+    The rows are selected on the weight's device and only the selected rows are
+    copied to host; copying the whole shard to host first would need a second
+    table-sized host array for the indexed rows.
+
+    Args:
+        mch: ZCH module holding the raw id to row mapping of this shard.
+        weight: embedding rows of this shard.
+        shard_offset: global row offset of this shard.
+        emb_name: export table name, for error messages.
+
+    Returns:
+        keys: raw ids, ascending.
+        values: embedding row per key.
+        scores: eviction score per key, zero when no eviction metadata is kept.
+        default_value: single embedding row served for any other key.
+    """
+    raw_ids = mch._buffers["_mch_sorted_raw_ids"].to(weight.device)
+    remapped_ids = mch._buffers["_mch_remapped_ids_mapping"].to(weight.device)
+    # LFU keeps counts only, LRU keeps last access iter only, DistanceLFU keeps
+    # both; the present one maps onto the dynamic table score. Export and serving
+    # do not require score semantics, so a table with no eviction metadata emits
+    # a zero score per key instead of failing the export.
+    score_buffer = None
+    for buffer_name in ("_mch_last_access_iter", "_mch_counts"):
+        score_buffer = mch._buffers.get(buffer_name)
+        if score_buffer is not None:
+            break
+    if score_buffer is not None:
+        score_buffer = score_buffer.to(weight.device)
+
+    valid_mask = raw_ids != torch.iinfo(torch.int64).max
+    keys = raw_ids[valid_mask]
+    rows = remapped_ids[valid_mask] - shard_offset
+    if score_buffer is not None:
+        scores = score_buffer[valid_mask].to(torch.int64)
+    else:
+        scores = torch.zeros(keys.numel(), dtype=torch.int64, device=weight.device)
+    num_rows = weight.shape[0]
+    if keys.numel() > 0 and (
+        int(rows.min().item()) < 0 or int(rows.max().item()) >= num_rows
+    ):
+        raise ValueError(
+            f"zch table {emb_name} remapped row range "
+            f"[{int(rows.min().item())}, {int(rows.max().item())}] is out of "
+            f"its {num_rows} embedding rows at shard offset {shard_offset}."
+        )
+    # the row MCHManagedCollisionModule.remap() sends unmatched ids to.
+    default_row = mch._output_global_offset + mch._zch_size - 1 - shard_offset
+    if default_row < 0 or default_row >= num_rows:
+        raise ValueError(
+            f"zch table {emb_name} default row {default_row} is out of its "
+            f"{num_rows} embedding rows at shard offset {shard_offset}."
+        )
+    return (
+        keys.cpu(),
+        weight.index_select(0, rows).cpu().numpy(),
+        scores.cpu(),
+        weight[default_row : default_row + 1].cpu().numpy(),
+    )
+
+
+def _get_sparse_embedding_tensor(
+    model: nn.Module,
+    checkpoint_path: str,
+    embedding_infos: Dict[str, BaseEmbeddingConfig],
+    embedding_bag_info: Dict[str, BaseEmbeddingConfig],
+) -> Tuple[
+    Dict[str, torch.Tensor],
+    Dict[str, torch.Tensor],
+    Dict[str, Any],
+    Dict[str, Any],
+]:
+    """Get Embedding Tensors for sparse part.
+
+    Returns:
+        out: regular sparse embedding tensors keyed by table FQN.
+        dynamic_out: dynamicemb and zch keys/values/scores keyed by composite
+            names, plus a default value entry per zch table. Empty if no
+            dynamic embedding table exists.
+        emb_meta: per-table meta (shape/dtype/memory) for ALL sparse tables.
+        feat_meta: feature -> embedding_name / pooling mapping.
+    """
+    emb_name_to_emb_dim: Dict[str, int] = dict()
+    feat_name_to_pooling = dict()
+
+    feat_name_impl_to_emb_name = dict()
+    emb_name_to_feat_name_impl = dict()
+
+    for table_fqn, emb_info in embedding_infos.items():
+        export_emb_name = checkpoint_util.remap_input_tile_user_key(table_fqn)
+        emb_name_to_emb_dim.setdefault(export_emb_name, emb_info.embedding_dim)
+        feat_name_impl_list = emb_name_to_feat_name_impl.setdefault(export_emb_name, [])
+        for feat_name in emb_info.feature_names:
+            feat_name_impl = feat_name + "__ec"
+            if feat_name_impl not in feat_name_impl_list:
+                feat_name_impl_list.append(feat_name_impl)
+            feat_name_impl_to_emb_name[feat_name_impl] = export_emb_name
+            feat_name_to_pooling[feat_name_impl] = "NONE"
+
+    for table_fqn, emb_info in embedding_bag_info.items():
+        export_emb_name = checkpoint_util.remap_input_tile_user_key(table_fqn)
+        emb_name_to_emb_dim.setdefault(export_emb_name, emb_info.embedding_dim)
+        feat_name_impl_list = emb_name_to_feat_name_impl.setdefault(export_emb_name, [])
+        for feat_name in emb_info.feature_names:
+            feat_name_impl = feat_name + "__ebc"
+            if feat_name_impl not in feat_name_impl_list:
+                feat_name_impl_list.append(feat_name_impl)
+            feat_name_impl_to_emb_name[feat_name_impl] = export_emb_name
+            feat_name_to_pooling[feat_name_impl] = str(emb_info.pooling).split(".")[-1]
+
+    out: Dict[str, Any] = {}
+    # dynamicemb keys/values are saved into a separate npz, kept in this dict.
+    dynamic_out: Dict[str, Any] = {}
+
+    # per-table export metadata (logical shape/dtype plus optional storage info).
+    emb_name_to_export_meta: Dict[str, Any] = {}
+    # set of emb_names that are dynamic embedding tables (loaded from
+    # checkpoint's `dynamicemb/` directory rather than model state_dict).
+    dynamic_emb_names: Set[str] = set()
+    # per-emb_name npz entry names for dynamic tables on this rank.
+    dynamic_key_names: Dict[str, List[str]] = defaultdict(list)
+    dynamic_value_names: Dict[str, List[str]] = defaultdict(list)
+    dynamic_score_names: Dict[str, List[str]] = defaultdict(list)
+    # zch tables serve a trained default row on key miss, plain dynamic tables
+    # have no such row, so this entry is optional.
+    dynamic_default_value_names: Dict[str, List[str]] = defaultdict(list)
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    zch_tables: Dict[str, MCHManagedCollisionModule] = _get_zch_export_tables(
+        model, emb_name_to_emb_dim
+    )
+
+    def _add_sparse_table(
+        export_emb_name: str, weight: torch.Tensor, shard_offset: int
+    ) -> None:
+        emb_dim = emb_name_to_emb_dim[export_emb_name]
+        mch = zch_tables.get(export_emb_name)
+        if mch is None:
+            export_tensor, export_meta = _prepare_sparse_export_values(
+                weight.detach().cpu().numpy(), emb_dim, export_emb_name
+            )
+            out[export_emb_name] = export_tensor
+            emb_name_to_export_meta[export_emb_name] = export_meta
+            return
+
+        # zch rows are gathered on device, so only the exported rows reach host.
+        keys, values, scores, default_value = _zch_table_to_dynamic(
+            mch, weight.detach(), shard_offset, export_emb_name
+        )
+        export_tensor, export_meta = _prepare_sparse_export_values(
+            values, emb_dim, export_emb_name
+        )
+        # rowwise quantization makes each row self-contained, so the default row
+        # decodes the same way whether or not it is quantized with the others.
+        export_default_value, _ = _prepare_sparse_export_values(
+            default_value, emb_dim, export_emb_name
+        )
+        emb_name_to_export_meta[export_emb_name] = export_meta
+        logger.info(
+            f"convert zch table {export_emb_name} to dynamic embedding table, "
+            f"{keys.numel()} of {mch._zch_size - 1} ids exported, ids not "
+            "exported are served the exported default embedding."
+        )
+        key_name = f"{export_emb_name}.keys"
+        value_name = f"{export_emb_name}.values"
+        score_name = f"{export_emb_name}.scores"
+        default_value_name = f"{export_emb_name}.default_value"
+        dynamic_out[key_name] = keys
+        dynamic_out[value_name] = export_tensor
+        dynamic_out[score_name] = scores
+        dynamic_out[default_value_name] = export_default_value
+        dynamic_emb_names.add(export_emb_name)
+        dynamic_key_names[export_emb_name].append(key_name)
+        dynamic_value_names[export_emb_name].append(value_name)
+        dynamic_score_names[export_emb_name].append(score_name)
+        dynamic_default_value_names[export_emb_name].append(default_value_name)
+
+    state_values_by_emb = {}
+    for name, values in model.state_dict().items():
+        if not name.endswith(".weight"):
+            continue
+        table_fqn = name[: -len(".weight")]
+        export_emb_name = checkpoint_util.remap_input_tile_user_key(table_fqn)
+        state_values_by_emb[export_emb_name] = values
+
+    for export_emb_name, values in state_values_by_emb.items():
+        emb_dim = emb_name_to_emb_dim[export_emb_name]
+        if isinstance(values, DTensor):
+            raise ValueError("DTensors are not considered yet.")
+        elif isinstance(values, ShardedTensor):
+            _len_local_shards = len(values.local_shards())
+            assert _len_local_shards in [0, 1], "other cases are not considered."
+
+            if _len_local_shards == 1:
+                for _idx, shards_meta in enumerate(values.metadata().shards_metadata):
+                    placement = shards_meta.placement
+                    assert placement is not None
+                    if placement.rank() == rank:
+                        # name = name + f"/part_{idx}_{num_shards}"
+                        if list(values.shape)[-1] == emb_dim:
+                            # dynamicemb may have a dummy tensor in state_dict, skip it.
+                            _add_sparse_table(
+                                export_emb_name,
+                                values.local_tensor(),
+                                shards_meta.shard_offsets[0],
+                            )
+                            # shard_offsets[feat_name_impl] = shards_meta.shard_offsets
+        elif list(values.shape)[-1] == emb_dim:
+            # dynamicemb may have a dummy tensor in state_dict, skip it.
+            _add_sparse_table(export_emb_name, values, 0)
+            # shard_offsets[feat_name_impl] = shards_meta.shard_offsets
+
+    dynamicemb_path = os.path.join(checkpoint_path, "dynamicemb")
+    if os.path.exists(dynamicemb_path):
+        key_files = sorted(
+            glob.glob(os.path.join(dynamicemb_path, "*/*_emb_keys.rank_*.world_size_*"))
+        )
+        key_files = _dedup_key_files_by_realpath(key_files)
+        key_pattern = re.compile(
+            r"^(?P<emb_name>.+)_emb_keys\.rank_(?P<idx>\d+)\.world_size_(?P<num_shards>\d+)$"
+        )
+        key_files_by_emb = defaultdict(list)
+        for key_file in key_files:
+            path_parts = key_file.split(os.path.sep)
+            match = key_pattern.match(path_parts[-1])
+            if not match:
+                continue
+            emb_name = match.group("emb_name")
+            module_fqn = _dynamic_sparse_module_fqn(dynamicemb_path, key_file)
+            table_candidates = [
+                f"{module_fqn}.embedding_bags.{emb_name}",
+                f"{module_fqn}.embeddings.{emb_name}",
+            ]
+            export_emb_name = next(
+                table_fqn
+                for table_fqn in map(
+                    checkpoint_util.remap_input_tile_user_key, table_candidates
+                )
+                if table_fqn in emb_name_to_emb_dim
+            )
+            ckpt_rank = int(match.group("idx"))
+            ckpt_world_size = int(match.group("num_shards"))
+            key_files_by_emb[export_emb_name].append(
+                (emb_name, ckpt_rank, ckpt_world_size, key_file)
+            )
+
+        for emb_name, emb_key_files in key_files_by_emb.items():
+            emb_dim = emb_name_to_emb_dim[emb_name]
+            key_name = f"{emb_name}.keys"
+            value_name = f"{emb_name}.values"
+            score_name = f"{emb_name}.scores"
+            keys_list = []
+            values_list = []
+            scores_list = []
+            ckpt_world_sizes = {x[2] for x in emb_key_files}
+            if len(ckpt_world_sizes) > 1:
+                raise ValueError(
+                    f"dynamic embedding {emb_name} has inconsistent checkpoint "
+                    f"world_size values: {sorted(ckpt_world_sizes)}"
+                )
+            for ckpt_emb_name, ckpt_rank, ckpt_world_size, key_file in sorted(
+                emb_key_files
+            ):
+                if ckpt_rank % world_size != rank:
+                    continue
+                with open(key_file, "rb") as f:
+                    keys = torch.tensor(
+                        np.fromfile(f, dtype=np.int64), dtype=torch.int64
+                    )
+                value_file = os.path.join(
+                    os.path.dirname(key_file),
+                    f"{ckpt_emb_name}_emb_values.rank_{ckpt_rank}.world_size_{ckpt_world_size}",
+                )
+                with open(value_file, "rb") as f:
+                    values = torch.tensor(
+                        np.fromfile(f, dtype=np.float32), dtype=torch.float32
+                    )
+                score_file = os.path.join(
+                    os.path.dirname(key_file),
+                    f"{ckpt_emb_name}_emb_scores.rank_{ckpt_rank}.world_size_{ckpt_world_size}",
+                )
+                if not os.path.exists(score_file):
+                    raise FileNotFoundError(
+                        f"dynamic embedding {emb_name} score file not found: "
+                        f"{score_file}"
+                    )
+                with open(score_file, "rb") as f:
+                    scores = torch.tensor(
+                        np.fromfile(f, dtype=np.int64), dtype=torch.int64
+                    )
+                if keys.numel() != scores.numel():
+                    raise ValueError(
+                        f"dynamic embedding {emb_name} key/score row mismatch: "
+                        f"keys={keys.numel()}, scores={scores.numel()}, "
+                        f"key_file={key_file}, score_file={score_file}"
+                    )
+                if values.numel() != keys.numel() * emb_dim:
+                    raise ValueError(
+                        f"dynamic embedding {emb_name} value row mismatch: "
+                        f"keys={keys.numel()}, value_elements={values.numel()}, "
+                        f"embedding_dim={emb_dim}"
+                    )
+                keys_list.append(keys)
+                values_list.append(values.view([-1, emb_dim]))
+                scores_list.append(scores)
+
+            if not keys_list:
+                continue
+            keys = torch.cat(keys_list)
+            values_2d = torch.cat(values_list, dim=0)
+            scores = torch.cat(scores_list)
+            export_values, export_meta = _prepare_sparse_export_values(
+                values_2d, emb_dim, emb_name
+            )
+            dynamic_out[key_name] = keys
+            dynamic_out[value_name] = export_values
+            dynamic_out[score_name] = scores
+            emb_name_to_export_meta[emb_name] = export_meta
+            dynamic_emb_names.add(emb_name)
+            dynamic_key_names[emb_name].append(key_name)
+            dynamic_value_names[emb_name].append(value_name)
+            dynamic_score_names[emb_name].append(score_name)
+
+    emb_meta = {}
+    for emb_name, feat_name_impl_list in emb_name_to_feat_name_impl.items():
+        if emb_name not in emb_name_to_export_meta:
+            # table not present on this rank (e.g. sharded to other ranks)
+            continue
+        export_meta = emb_name_to_export_meta[emb_name]
+        is_dynamic = emb_name in dynamic_emb_names
+        t_meta: Dict[str, Any] = {
+            "feat_name_impl": feat_name_impl_list,
+            "dense": False,
+            "is_dynamic": is_dynamic,
+            # "shard_offsets": shard_offsets[name],
+            # "pooling": feat_name_to_pooling[name],
+        }
+        t_meta.update(export_meta)
+        if is_dynamic:
+            # Entry names inside sparse_dynamic_embedding-*.npz. The serving
+            # processor expects one key/value/score entry triplet and applies it
+            # to all dynamic npz shards. `default_value_name` is optional and
+            # only written for zch tables, absent means zeros on key miss.
+            t_meta["key_dtype"] = "int64"
+            t_meta["score_dtype"] = "int64"
+            key_names = list(dict.fromkeys(dynamic_key_names[emb_name]))
+            value_names = list(dict.fromkeys(dynamic_value_names[emb_name]))
+            score_names = list(dict.fromkeys(dynamic_score_names[emb_name]))
+            if len(key_names) != 1 or len(value_names) != 1 or len(score_names) != 1:
+                raise ValueError(
+                    f"dynamic embedding {emb_name} expects one key/value/score "
+                    f"npz entry triplet, got {key_names} / {value_names} / "
+                    f"{score_names}"
+                )
+            t_meta["key_name"] = key_names[0]
+            t_meta["value_name"] = value_names[0]
+            t_meta["score_name"] = score_names[0]
+            default_value_names = list(
+                dict.fromkeys(dynamic_default_value_names[emb_name])
+            )
+            if len(default_value_names) > 1:
+                raise ValueError(
+                    f"dynamic embedding {emb_name} expects at most one "
+                    f"default value npz entry, got {default_value_names}"
+                )
+            if default_value_names:
+                t_meta["default_value_name"] = default_value_names[0]
+        emb_meta[emb_name] = t_meta
+
+    feat_meta = {}
+    for feat_name_impl, emb_name in feat_name_impl_to_emb_name.items():
+        t_meta = {
+            "embedding_name": emb_name,
+            "pooling": feat_name_to_pooling[feat_name_impl],
+        }
+        feat_meta[feat_name_impl] = t_meta
+    return out, dynamic_out, emb_meta, feat_meta

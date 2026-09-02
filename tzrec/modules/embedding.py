@@ -11,7 +11,6 @@
 
 import os
 from collections import OrderedDict, defaultdict
-from functools import partial  # NOQA
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union, cast
 
 import torch
@@ -42,9 +41,11 @@ from tzrec.modules.dense_embedding_collection import (
 from tzrec.modules.sequence import create_seq_encoder
 from tzrec.protos import model_pb2
 from tzrec.protos.model_pb2 import FeatureGroupConfig, SeqGroupConfig
+from tzrec.utils import init_util
 from tzrec.utils.fx_util import (
     fx_int_item,
     fx_mark_keyed_tensor,
+    fx_mark_seq_ec_jt,
     fx_mark_seq_len,
     fx_mark_seq_tensor,
     fx_mark_tensor,
@@ -58,6 +59,7 @@ torch.fx.wrap(fx_mark_keyed_tensor)
 torch.fx.wrap(fx_mark_tensor)
 torch.fx.wrap(fx_mark_seq_tensor)
 torch.fx.wrap(fx_mark_seq_len)
+torch.fx.wrap(fx_mark_seq_ec_jt)
 
 
 @torch.fx.wrap
@@ -100,6 +102,32 @@ def _merge_list_of_jt_dict(
     for jt_dict in list_of_jt_dict:
         result.update(jt_dict)
     return result
+
+
+def _remap_mark_jt_dict(
+    d_jt: Dict[str, JaggedTensor],
+    feature_keys: List[Tuple[str, str]],
+) -> Dict[str, JaggedTensor]:
+    """Remap EmbeddingCollection output keys to shared keys and mark seq jts.
+
+    EmbeddingCollection output keys are paired with the shared feature names the
+    downstream feature groups consume; each shared-name JaggedTensor is also
+    marked for torch.fx sequence tracing. Left unwrapped so the per-feature
+    ``fx_mark_seq_ec_jt`` calls stay individual graph nodes.
+
+    Args:
+        d_jt: EmbeddingCollection output keyed by output key.
+        feature_keys: list of (output_key, shared_key) pairs.
+
+    Returns:
+        Dict keyed by shared_key.
+    """
+    new_d_jt: Dict[str, JaggedTensor] = {}
+    for output_key, shared_key in feature_keys:
+        val = d_jt[output_key]
+        fx_mark_seq_ec_jt(shared_key, val)
+        new_d_jt[shared_key] = val
+    return new_d_jt
 
 
 @torch.fx.wrap
@@ -375,7 +403,9 @@ class EmbeddingGroup(nn.Module):
         else:
             dims = self.emb_impls[impl_key].group_dims(group_name)
             if group_name in self._group_name_to_seq_encoders:
-                for seq_encoder in self._group_name_to_seq_encoders[group_name]:
+                for seq_encoder in cast(
+                    nn.ModuleList, self._group_name_to_seq_encoders[group_name]
+                ):
                     dims.append(seq_encoder.output_dim())
             return dims
 
@@ -502,7 +532,7 @@ class EmbeddingGroup(nn.Module):
         seq_feature_dict = {}
         for group_name, seq_encoders in self._group_name_to_seq_encoders.items():
             new_feature = []
-            for seq_encoder in seq_encoders:
+            for seq_encoder in cast(nn.ModuleList, seq_encoders):
                 new_feature.append(seq_encoder(result))
             seq_feature_dict[group_name] = torch.cat(new_feature, dim=-1)
         return _update_dict_tensor(result, seq_feature_dict)
@@ -620,6 +650,36 @@ def _add_mc_module(
     mc_modules[emb_name] = mc_module
 
 
+def _ec_output_key_to_shared_name(
+    ec: EmbeddingCollection,
+    emb_name_to_feature_to_shared_name: Dict[str, Dict[str, str]],
+) -> List[Tuple[str, str]]:
+    """Pair EmbeddingCollection output keys with shared feature names.
+
+    EmbeddingCollection suffixes its output key with the table name when a feature
+    is shared by more than one table of the collection, so the output key can not
+    be assumed to be the feature name.
+
+    Args:
+        ec(EmbeddingCollection): an instance of EmbeddingCollection.
+        emb_name_to_feature_to_shared_name(Dict[str, Dict[str, str]]): a dict of
+            embedding_name to a dict of feature_name to shared feature name.
+
+    Returns:
+        a list of (embedding collection output key, shared feature name).
+    """
+    feat_list = []
+    for emb_config, output_keys in zip(
+        ec._embedding_configs, ec.embedding_names_by_table()
+    ):
+        for feature_name, output_key in zip(emb_config.feature_names, output_keys):
+            shared_name = emb_name_to_feature_to_shared_name[emb_config.name].get(
+                feature_name, feature_name
+            )
+            feat_list.append((output_key, shared_name))
+    return feat_list
+
+
 class EmbeddingGroupImpl(nn.Module):
     """Applies embedding lookup transformation for feature group.
 
@@ -723,7 +783,9 @@ class EmbeddingGroupImpl(nn.Module):
                             wide_embedding_dim or 4
                         )
                         if wide_init_fn:
-                            emb_bag_config.init_fn = eval(f"partial({wide_init_fn})")
+                            emb_bag_config.init_fn = init_util.create_init_fn(
+                                wide_init_fn
+                            )
                     # we may modify ebc name at feat_to_group_to_emb_name, e.g., wide
                     emb_bag_config.name = feat_to_group_to_emb_name[name][group_name]
                     const = feature.parameter_constraints(emb_bag_config)
@@ -901,7 +963,9 @@ class EmbeddingGroupImpl(nn.Module):
             kts.append(kt)
 
         if self.has_dense:
-            fx_mark_keyed_tensor(self._all_group_str + "__dense", dense_feature)
+            fx_mark_keyed_tensor(
+                self._all_group_str + "__dense", dense_feature, is_dense=True
+            )
             if self.has_dense_embedding:
                 kts.append(self.dense_ec(dense_feature))
             else:
@@ -1007,6 +1071,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             else:
                 shared_feature_flag[feature_name] = False
 
+        emb_name_to_feature_to_shared_name = defaultdict(dict)
         for feature_group in feature_groups:
             query_dim = 0
             sequence_dim = 0
@@ -1022,6 +1087,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             for name in feature_names:
                 shared_name = name
                 feature = name_to_feature[name]
+
                 if feature.is_sparse:
                     output_dim = feature.output_dim
                     emb_config = feature.emb_config
@@ -1029,6 +1095,11 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     assert emb_config is not None
                     # we may/could modify ec name at feat_to_group_to_emb_name
                     emb_config.name = feat_to_group_to_emb_name[name][group_name]
+                    if shared_feature_flag[name]:
+                        shared_name = shared_name + "@" + emb_config.name
+                    emb_name_to_feature_to_shared_name[emb_config.name][name] = (
+                        shared_name
+                    )
                     embedding_dim = emb_config.embedding_dim
                     const = feature.parameter_constraints(emb_config)
 
@@ -1084,9 +1155,6 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                                 ] = const
                         if feature.is_sequence and feature.value_dim != 1:
                             self.has_mulval_seq = True
-
-                    if shared_feature_flag[name]:
-                        shared_name = shared_name + "@" + emb_config.name
                 else:
                     output_dim = feature.output_dim
                     if feature.is_sequence:
@@ -1130,6 +1198,12 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 list(emb_configs.values()), device=device
             )
 
+        self.ec_dict_features = OrderedDict()
+        for k, ec in self.ec_dict.items():
+            self.ec_dict_features[k] = _ec_output_key_to_shared_name(
+                ec, emb_name_to_feature_to_shared_name
+            )
+
         self.mc_ec_dict = nn.ModuleDict()
         for k, emb_configs in dim_to_mc_emb_configs.items():
             self.mc_ec_dict[str(k)] = ManagedCollisionEmbeddingCollection(
@@ -1139,11 +1213,22 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 ),
             )
 
+        self.mc_ec_dict_features = OrderedDict()
+        for k, mc_ec in self.mc_ec_dict.items():
+            self.mc_ec_dict_features[k] = _ec_output_key_to_shared_name(
+                mc_ec._embedding_module, emb_name_to_feature_to_shared_name
+            )
+
         if need_input_tile_emb:
             self.ec_dict_user = nn.ModuleDict()
             for k, emb_configs in dim_to_emb_configs_user.items():
                 self.ec_dict_user[str(k)] = EmbeddingCollection(
                     list(emb_configs.values()), device=device
+                )
+            self.ec_dict_features_user = OrderedDict()
+            for k, ec in self.ec_dict_user.items():
+                self.ec_dict_features_user[k] = _ec_output_key_to_shared_name(
+                    ec, emb_name_to_feature_to_shared_name
                 )
 
             self.mc_ec_dict_user = nn.ModuleDict()
@@ -1153,6 +1238,12 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     ManagedCollisionCollection(
                         dim_to_mc_modules_user[k], list(emb_configs.values())
                     ),
+                )
+
+            self.mc_ec_dict_features_user = OrderedDict()
+            for k, mc_ec in self.mc_ec_dict_user.items():
+                self.mc_ec_dict_features_user[k] = _ec_output_key_to_shared_name(
+                    mc_ec._embedding_module, emb_name_to_feature_to_shared_name
                 )
 
     def group_dims(self, group_name: str) -> List[int]:
@@ -1205,23 +1296,39 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         dense_t_dict: Dict[str, torch.Tensor] = {}
 
         if self.has_sparse:
-            for ec in self.ec_dict.values():
-                sparse_jt_dict_list.append(ec(sparse_feature))
+            for feature_keys, ec in zip(
+                self.ec_dict_features.values(), self.ec_dict.values()
+            ):
+                sparse_jt_dict_list.append(
+                    _remap_mark_jt_dict(ec(sparse_feature), feature_keys)
+                )
 
         if self.has_mc_sparse:
-            for ec in self.mc_ec_dict.values():
-                sparse_jt_dict_list.append(ec(sparse_feature)[0])
+            for feature_keys, mc_ec in zip(
+                self.mc_ec_dict_features.values(), self.mc_ec_dict.values()
+            ):
+                sparse_jt_dict_list.append(
+                    _remap_mark_jt_dict(mc_ec(sparse_feature)[0], feature_keys)
+                )
 
         if self.has_mulval_seq:
             seq_mulval_length_jt_dict_list.append(sequence_mulval_lengths.to_dict())
 
         if self.has_sparse_user:
-            for ec in self.ec_dict_user.values():
-                sparse_jt_dict_list.append(ec(sparse_feature_user))
+            for feature_keys, ec in zip(
+                self.ec_dict_features_user.values(), self.ec_dict_user.values()
+            ):
+                sparse_jt_dict_list.append(
+                    _remap_mark_jt_dict(ec(sparse_feature_user), feature_keys)
+                )
 
         if self.has_mc_sparse_user:
-            for ec in self.mc_ec_dict_user.values():
-                sparse_jt_dict_list.append(ec(sparse_feature_user)[0])
+            for feature_keys, mc_ec in zip(
+                self.mc_ec_dict_features_user.values(), self.mc_ec_dict_user.values()
+            ):
+                sparse_jt_dict_list.append(
+                    _remap_mark_jt_dict(mc_ec(sparse_feature_user)[0], feature_keys)
+                )
 
         if self.has_mulval_seq_user:
             seq_mulval_length_jt_dict_list.append(

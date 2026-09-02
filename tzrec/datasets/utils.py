@@ -849,7 +849,7 @@ def calc_slice_intervals(
     pre_total_remain: int = 0,
     checkpoint_state: Optional[Dict[str, int]] = None,
     input_path: Optional[str] = None,
-) -> List[Tuple[int, int]]:
+) -> Tuple[List[Tuple[int, int]], int]:
     """Redistribute remaining intervals among workers.
 
     Flattens all intervals into a total row count, then assigns a portion
@@ -872,6 +872,7 @@ def calc_slice_intervals(
         total_remain (int): remaining total count in curr-table is
             insufficient to meet the batch_size requirement for each worker.
     """
+    intervals: List[Tuple[int, int]] = []
     if checkpoint_state:
         intervals = calc_remaining_intervals(checkpoint_state, input_path, total_rows)
         total_rows = sum(end - start for start, end in intervals)
@@ -915,7 +916,7 @@ def calc_slice_intervals(
 
 
 def remove_nullable(field_type: pa.DataType) -> pa.DataType:
-    """Recursive removal of the null=False property from lists and nested lists."""
+    """Recursive removal of the null=False property from lists, nested lists, maps."""
     if pa.types.is_list(field_type):
         # Get element fields
         value_field = field_type.value_field
@@ -925,6 +926,11 @@ def remove_nullable(field_type: pa.DataType) -> pa.DataType:
         normalized_value_type = remove_nullable(normalized_value_field.type)
         # Construct a new list type
         return pa.list_(normalized_value_type)
+
+    elif pa.types.is_map(field_type):
+        return pa.map_(
+            remove_nullable(field_type.key_type), remove_nullable(field_type.item_type)
+        )
 
     else:
         return field_type

@@ -16,10 +16,11 @@ import os
 import queue
 import re
 import shutil
+import tempfile
 import threading
 import weakref
 from dataclasses import replace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Container, Dict, List, Optional, Set, Tuple, cast
 
 import torch
 import torch.distributed as dist
@@ -38,10 +39,55 @@ from torch.distributed.checkpoint.default_planner import (
 )
 from torchrec.modules.mc_modules import MCHManagedCollisionModule
 
+from tzrec.acc.utils import is_input_tile_emb
 from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
+from tzrec.optim.ema import DenseEMA
 from tzrec.protos import export_pb2
+from tzrec.utils import env_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
+
+# INPUT_TILE=3 load-time fallback from user-side keys to non-user checkpoint keys.
+_INPUT_TILE_USER_REPLACEMENTS: Tuple[Tuple[str, str], ...] = (
+    (".ebc_user.embedding_bags.", ".ebc.embedding_bags."),
+    (".mc_ebc_user._embedding_module.", ".mc_ebc._embedding_module."),
+    (
+        ".mc_ebc_user._managed_collision_collection.",
+        ".mc_ebc._managed_collision_collection.",
+    ),
+    (".ec_dict_user.", ".ec_dict."),
+    (".mc_ec_dict_user.", ".mc_ec_dict."),
+)
+
+
+def remap_input_tile_user_key(
+    fqn: str, valid_keys: Optional[Container[str]] = None
+) -> str:
+    """Map an INPUT_TILE=3 user-side state key to its non-user twin key.
+
+    INPUT_TILE=3 export adds user-side twin modules (``ebc_user``,
+    ``mc_ebc_user``, ``ec_dict_user``, ``mc_ec_dict_user``) absent from
+    training state; their weights come from the non-user twins. Applies the
+    first replacement pattern that yields a key accepted by ``valid_keys``
+    (the first matching pattern when unset), so callers fall back through
+    the patterns exactly like a checkpoint load does.
+
+    Args:
+        fqn: state key to remap.
+        valid_keys: when given, only a candidate present here is used.
+
+    Returns:
+        The remapped non-user key, or ``fqn`` unchanged when no pattern
+        matches (or yields a valid candidate).
+    """
+    for new_pat, old_pat in _INPUT_TILE_USER_REPLACEMENTS:
+        if new_pat not in fqn:
+            continue
+        candidate = fqn.replace(new_pat, old_pat)
+        if valid_keys is None or candidate in valid_keys:
+            return candidate
+    return fqn
+
 
 # queue token meaning "run a prune pass"; ``None`` means "stop the worker".
 _PRUNE_REQUEST = object()
@@ -60,6 +106,10 @@ class PartialLoadPlanner(DefaultLoadPlanner):
             do not include the current rank's boundaries would crash
             ``validate_state()``. Set this when the saved world size is
             not a multiple divisor of the current world size.
+        warn_on_missing_keys (bool): Log states absent from the checkpoint.
+
+    Model states missing from the checkpoint are skipped with a warning and
+    recorded in ``skipped_keys``.
     """
 
     def __init__(
@@ -68,10 +118,13 @@ class PartialLoadPlanner(DefaultLoadPlanner):
         flatten_sharded_tensors: bool = True,
         ckpt_param_map_path: Optional[str] = None,
         skip_output_segments_tensor: bool = False,
+        warn_on_missing_keys: bool = True,
     ) -> None:
         super().__init__(flatten_state_dict, flatten_sharded_tensors)
         self._ckpt_param_map = dict()
         self._skip_output_segments_tensor = skip_output_segments_tensor
+        self._warn_on_missing_keys = warn_on_missing_keys
+        self.skipped_keys: List[str] = []
         if ckpt_param_map_path:
             with open(ckpt_param_map_path) as f:
                 for line in f.readlines():
@@ -114,20 +167,36 @@ class PartialLoadPlanner(DefaultLoadPlanner):
                 fqn_remap_set.add(fqn)
                 logger.info(f"Remap restore state [{fqn}] from [{meta_fqn}]")
 
-            for ec_new, ec_old in ec_compat_map.items():
-                if ec_new in meta_fqn:
-                    new_meta_fqn = meta_fqn
-                    meta_fqn = new_meta_fqn.replace(ec_new, ec_old)
+            # INPUT_TILE=3 export adds user-side twin modules absent from
+            # training checkpoints. Remap them before EC compatibility handling.
+            if (
+                is_input_tile_emb()
+                and meta_fqn not in self.metadata.state_dict_metadata
+            ):
+                candidate = remap_input_tile_user_key(meta_fqn)
+                if candidate != meta_fqn:
+                    logger.info(f"Remap INPUT_TILE=3 state [{fqn}] from [{candidate}]")
+                    meta_fqn = candidate
                     fqn_remap_set.add(fqn)
-                    logger.warning(
-                        f"Remap EmbeddingCollection state [{new_meta_fqn}] from old "
-                        "[{meta_fqn}], will be deprecated when tzrec version >= 1.0.0"
-                    )
+
+            if meta_fqn not in self.metadata.state_dict_metadata:
+                for ec_new, ec_old in ec_compat_map.items():
+                    if ec_new in meta_fqn:
+                        new_meta_fqn = meta_fqn
+                        meta_fqn = new_meta_fqn.replace(ec_new, ec_old)
+                        fqn_remap_set.add(fqn)
+                        logger.warning(
+                            f"Remap EmbeddingCollection state [{new_meta_fqn}] from "
+                            "old [{meta_fqn}], will be deprecated when tzrec version "
+                            ">= 1.0.0"
+                        )
 
             if meta_fqn in self.metadata.state_dict_metadata:
                 md = self.metadata.state_dict_metadata[meta_fqn]
             else:
-                logger.warning(f"Skip restore state [{fqn}]")
+                if self._warn_on_missing_keys:
+                    logger.warning(f"Skip restore state [{fqn}]")
+                self.skipped_keys.append(fqn)
                 continue
 
             read_items = []
@@ -172,6 +241,11 @@ def _get_checkpoint_step(ckpt_path: str) -> int:
 def latest_checkpoint(model_dir: str) -> Tuple[Optional[str], int]:
     """Find latest checkpoint under a directory.
 
+    A path that already names a checkpoint (contains ``model.ckpt-``) is returned
+    as given, without checking that it exists. Otherwise the directory is searched,
+    preferring the newest ``model.ckpt-<step>`` in it, then the directory itself,
+    then a ``model.ckpt`` in it. The last two carry no step, so they report 0.
+
     Args:
         model_dir: model directory
 
@@ -184,12 +258,13 @@ def latest_checkpoint(model_dir: str) -> Tuple[Optional[str], int]:
         ckpt_metas = glob.glob(os.path.join(model_dir, "model.ckpt-*" + os.path.sep))
         ckpt_metas = list(map(lambda x: x.rstrip(os.path.sep), ckpt_metas))
         if len(ckpt_metas) == 0:
-            model_ckpt_dir = os.path.join(model_dir, "model")
-            optim_ckpt_dir = os.path.join(model_dir, "optimizer")
-            if os.path.exists(model_ckpt_dir) or os.path.exists(optim_ckpt_dir):
-                return model_dir, 0
-            else:
-                return None, -1
+            # a producer of exactly one checkpoint tends to drop the -<step>
+            for ckpt_dir in (model_dir, os.path.join(model_dir, "model.ckpt")):
+                model_ckpt_dir = os.path.join(ckpt_dir, "model")
+                optim_ckpt_dir = os.path.join(ckpt_dir, "optimizer")
+                if os.path.exists(model_ckpt_dir) or os.path.exists(optim_ckpt_dir):
+                    return ckpt_dir, 0
+            return None, -1
         if len(ckpt_metas) > 1:
             ckpt_metas.sort(key=lambda x: _get_checkpoint_step(x))
         latest_ckpt_path = ckpt_metas[-1]
@@ -296,6 +371,7 @@ class CheckpointManager:
         self._eval_result_filename = eval_result_filename
         self._prune_queue: "queue.Queue[object]" = queue.Queue()
         self._prune_pending = False
+        self._protected_checkpoints: Set[str] = set()
         self._lock = threading.Lock()
         self._prune_worker: Optional[threading.Thread] = None
         self._finalizer: Optional[weakref.finalize] = None
@@ -310,6 +386,7 @@ class CheckpointManager:
         self._ts_group: Optional[dist.ProcessGroup] = None
         # cadence state owned here so dedupe is centralized across all save sites
         self._last_ckpt_step = -1
+        self._last_ckpt_dir: Optional[str] = None
         self._last_data_ts: Optional[float] = None
 
     def save(
@@ -318,14 +395,32 @@ class CheckpointManager:
         model: nn.Module,
         optimizer: Optional[optim.Optimizer] = None,
         dataloader_state: Optional[Dict[str, Any]] = None,
+        dense_ema: Optional[DenseEMA] = None,
+        data_ts: Optional[float] = None,
     ) -> str:
         """Save a checkpoint at the given step, then request an async prune."""
         ckpt_dir = os.path.join(self._model_dir, f"model.ckpt-{step}")
-        save_model(ckpt_dir, model, optimizer)
+        save_model(ckpt_dir, model, optimizer, dense_ema)
         if dataloader_state is not None:
             save_dataloader_state(ckpt_dir, dataloader_state)
+        save_meta(ckpt_dir, step, data_ts)
+        # last, so its presence means every file above is complete
+        save_success_marker(ckpt_dir)
+        self._last_ckpt_dir = ckpt_dir
         self.prune()
         return ckpt_dir
+
+    def protect_checkpoint(self, ckpt_path: str) -> None:
+        """Prevent an in-progress consumer from being pruned."""
+        with self._lock:
+            self._protected_checkpoints.add(self._canonical_checkpoint_path(ckpt_path))
+
+    def unprotect_checkpoint(self, ckpt_path: str) -> None:
+        """Allow a previously protected checkpoint to be pruned again."""
+        with self._lock:
+            self._protected_checkpoints.discard(
+                self._canonical_checkpoint_path(ckpt_path)
+            )
 
     def set_save_policy(
         self,
@@ -338,9 +433,10 @@ class CheckpointManager:
         """Configure when ``maybe_save`` fires (train path only).
 
         Sets cadence config only (never the ``_last_*`` state), so a watermark
-        seeded on resume survives. When timestamp triggers are active under a
-        distributed run, also creates the dedicated CPU (gloo) group used for the
-        per-step event-time gather -- a collective, so all ranks must call this.
+        seeded on resume survives. Under a distributed run, also creates the
+        dedicated CPU (gloo) group used to gather event-times -- a collective, so
+        all ranks must call this. The group is created even when the timestamp
+        triggers are off, because a save still records the event-time watermark.
 
         Args:
             save_steps: step interval; 0 disables the step trigger.
@@ -349,7 +445,7 @@ class CheckpointManager:
             ts_targets: absolute event-time targets (Unix-epoch seconds).
             ts_quorum: fraction of workers (0, 1] past a boundary to trigger a save.
         """
-        if (ts_interval_s > 0 or len(ts_targets) > 0) and not (0.0 < ts_quorum <= 1.0):
+        if not (0.0 < ts_quorum <= 1.0):
             raise ValueError(
                 f"save_checkpoints_timestamp_quorum must be in (0, 1], got {ts_quorum}."
             )
@@ -358,14 +454,18 @@ class CheckpointManager:
         self._ts_interval = ts_interval_s
         self._ts_targets = ts_targets
         self._ts_quorum = ts_quorum
-        if self.needs_worker_timestamps() and dist.is_initialized():
-            self._ts_group = dist.new_group(backend="gloo")
+        if dist.is_initialized():
+            self._ts_group = cast(
+                Optional[dist.ProcessGroup], dist.new_group(backend="gloo")
+            )
 
     def needs_worker_timestamps(self) -> bool:
         """Return whether the policy needs per-worker event-times gathered."""
         return self._ts_interval > 0 or len(self._ts_targets) > 0
 
-    def _reconcile_event_time(self, data_timestamp: float) -> Optional[float]:
+    def _reconcile_event_time(
+        self, data_timestamp: float, force: bool = False
+    ) -> Optional[float]:
         """Quorum-reconcile this rank's event-time across workers.
 
         Gathers over the CPU group from ``set_save_policy``. Each worker without a
@@ -375,11 +475,13 @@ class CheckpointManager:
 
         Args:
             data_timestamp: this rank's consumed event-time (seconds), -1.0 if none.
+            force: gather even when the timestamp triggers are off. Only safe once
+                the save decision is made, which is identical on every rank.
 
         Returns:
             The quorum event-time (seconds), or None.
         """
-        if not self.needs_worker_timestamps():
+        if not force and not self.needs_worker_timestamps():
             return None
         if dist.is_initialized():
             worker_ts: List[float] = [0.0] * dist.get_world_size(self._ts_group)
@@ -395,6 +497,7 @@ class CheckpointManager:
         model: nn.Module,
         optimizer: Optional[optim.Optimizer] = None,
         dataloader_state: Optional[Dict[str, Any]] = None,
+        dense_ema: Optional[DenseEMA] = None,
         *,
         epoch: Optional[int] = None,
         data_timestamp: float = -1.0,
@@ -414,6 +517,7 @@ class CheckpointManager:
             optimizer: optimizer to save, if any.
             dataloader_state: dataloader resume state; the event-time watermark is
                 stamped into it on save.
+            dense_ema: Dense EMA state to save, if enabled.
             epoch: current epoch; enables the epoch trigger when not None.
             data_timestamp: this rank's consumed event-time (seconds), -1.0 if none;
                 reconciled across workers (quorum) for the event-time trigger.
@@ -423,6 +527,11 @@ class CheckpointManager:
             True if a checkpoint was saved.
         """
         data_ts = self._reconcile_event_time(data_timestamp)
+        # copy so the watermark isn't leaked back into the train loop's state
+        if dataloader_state is not None:
+            dataloader_state = dict(dataloader_state)
+            if data_ts is not None:
+                dataloader_state[DATA_TS_WATERMARK] = data_ts
 
         want = final
         if self._save_steps > 0 and step > 0 and step % self._save_steps == 0:
@@ -443,16 +552,36 @@ class CheckpointManager:
             ):
                 want = True
 
-        if not want or step == self._last_ckpt_step:
+        if not want:
+            return False
+
+        if step == self._last_ckpt_step:
+            # a boundary save dedup'd against an already-saved step: refresh
+            # that checkpoint's state so the cleared + bumped bookkeeping is
+            # not lost to the dedupe (lockstep across ranks, so the collective
+            # in save_dataloader_state is safe).
+            if (
+                (final or epoch is not None)
+                and dataloader_state is not None
+                and self._last_ckpt_dir is not None
+            ):
+                save_dataloader_state(self._last_ckpt_dir, dataloader_state)
             return False
 
         self._last_ckpt_step = step
         if data_ts is not None:
-            # advance + persist the watermark on every save so resume is exact
+            # advance the watermark on every save so resume is exact
             self._last_data_ts = data_ts
-            if dataloader_state is not None:
-                dataloader_state[DATA_TS_WATERMARK] = data_ts
-        self.save(step, model, optimizer, dataloader_state)
+        # The checkpoint records what data it covers whether or not the event-time
+        # triggers are on. With the triggers on the gather above already produced
+        # that value, and repeating it would return the same result, so gather
+        # only when they are off: at most one gather per saved checkpoint, none
+        # per step. Doing it after the save decision is safe because that
+        # decision is identical on every rank, so the gather stays in lockstep.
+        report_ts = data_ts
+        if report_ts is None and not self.needs_worker_timestamps():
+            report_ts = self._reconcile_event_time(data_timestamp, force=True)
+        self.save(step, model, optimizer, dataloader_state, dense_ema, report_ts)
         return True
 
     def prune(self) -> None:
@@ -506,9 +635,18 @@ class CheckpointManager:
         model: nn.Module,
         optimizer: Optional[optim.Optimizer] = None,
         ckpt_param_map_path: Optional[str] = None,
+        dense_ema: Optional[DenseEMA] = None,
+        use_dense_ema: bool = False,
     ) -> None:
         """Restore model/optimizer state from a checkpoint dir."""
-        restore_model(ckpt_path, model, optimizer, ckpt_param_map_path)
+        restore_model(
+            ckpt_path,
+            model,
+            optimizer,
+            ckpt_param_map_path,
+            dense_ema=dense_ema,
+            use_dense_ema=use_dense_ema,
+        )
 
     def restore_dataloader_state(self, ckpt_path: str) -> Optional[Dict[str, Any]]:
         """Restore dataloader state saved alongside a checkpoint.
@@ -569,7 +707,10 @@ class CheckpointManager:
         if len(ckpt_metas) <= self._keep_checkpoint_max:
             return
         ckpt_metas.sort(key=_get_checkpoint_step)
-        protected = set(ckpt_metas[-self._keep_checkpoint_max :])
+        protected = {
+            self._canonical_checkpoint_path(path)
+            for path in ckpt_metas[-self._keep_checkpoint_max :]
+        }
         if (
             self._export_config is not None
             and self._export_config.exporter_type == "best"
@@ -578,14 +719,20 @@ class CheckpointManager:
                 self._model_dir, self._export_config, self._eval_result_filename
             )
             if best_ckpt_path is not None:
-                protected.add(best_ckpt_path.rstrip(os.path.sep))
+                protected.add(self._canonical_checkpoint_path(best_ckpt_path))
+        with self._lock:
+            protected.update(self._protected_checkpoints)
         for ckpt_path in ckpt_metas:
-            if ckpt_path not in protected:
+            if self._canonical_checkpoint_path(ckpt_path) not in protected:
                 logger.info(f"Removing old checkpoint {ckpt_path}...")
                 try:
                     shutil.rmtree(ckpt_path)
                 except Exception as e:  # noqa: BLE001
                     logger.warning(f"Failed to remove checkpoint {ckpt_path}: {e}")
+
+    @staticmethod
+    def _canonical_checkpoint_path(ckpt_path: str) -> str:
+        return os.path.abspath(ckpt_path.rstrip(os.path.sep))
 
 
 _DISTCP_RANK_RE = re.compile(r"__(\d+)_\d+\.distcp$")
@@ -777,11 +924,58 @@ def _redistribute_mch_state(model: nn.Module) -> None:
             m._buffers[name].copy_(new_meta)
 
 
+# Module-name segments that get a `_user` twin when INPUT_TILE=3 export
+# duplicates the embedding group into item/user halves. See
+# tzrec/modules/embedding.py:EmbeddingGroupImpl /
+# SequenceEmbeddingGroupImpl for the construction.
+_INPUT_TILE_USER_SEGMENTS = frozenset({"ebc", "mc_ebc", "ec_dict", "mc_ec_dict"})
+
+
+def _make_dynamicemb_input_tile_user_view(dynamicemb_path: str, view_path: str) -> str:
+    """Create a local symlink view for INPUT_TILE=3 dynamicemb loading.
+
+    The training checkpoint has non-user module paths, while INPUT_TILE=3
+    export adds user-side twins. Build aliases in a temporary local directory
+    instead of mutating the checkpoint directory.
+    """
+    entries = []
+    for entry in os.listdir(dynamicemb_path):
+        full_path = os.path.abspath(os.path.join(dynamicemb_path, entry))
+        if not os.path.isdir(full_path):
+            continue
+        entries.append((entry, full_path))
+        link_path = os.path.join(view_path, entry)
+        if not os.path.lexists(link_path):
+            os.symlink(full_path, link_path, target_is_directory=True)
+
+    for entry, full_path in entries:
+        segs = entry.split(".")
+        if any(seg.endswith("_user") for seg in segs):
+            continue
+        for i, seg in enumerate(segs):
+            if seg not in _INPUT_TILE_USER_SEGMENTS:
+                continue
+            user_segs = list(segs)
+            user_segs[i] = f"{seg}_user"
+            user_entry = ".".join(user_segs)
+            user_path = os.path.join(view_path, user_entry)
+            if os.path.lexists(user_path):
+                continue
+            os.symlink(full_path, user_path, target_is_directory=True)
+            logger.info(
+                f"created INPUT_TILE=3 dynamicemb alias {user_entry} -> {entry}"
+            )
+    return view_path
+
+
 def restore_model(
     checkpoint_dir: str,
     model: nn.Module,
     optimizer: Optional[optim.Optimizer] = None,
     ckpt_param_map_path: Optional[str] = None,
+    error_on_missing_keys: bool = False,
+    dense_ema: Optional[DenseEMA] = None,
+    use_dense_ema: bool = False,
 ) -> None:
     """Restore model state.
 
@@ -790,6 +984,11 @@ def restore_model(
         model (nn.Module): a EasyRec model.
         optimizer (optim.Optimizer, optional): a optimizer.
         ckpt_param_map_path (str): parameter mapping for checkpoint.
+        error_on_missing_keys (bool): If True, raise RuntimeError when the
+            model has states absent from the checkpoint instead of skipping
+            them with a warning (which would leave them uninitialized).
+        dense_ema: Dense EMA state to restore for continued training.
+        use_dense_ema: Overlay Dense EMA parameters onto the restored model.
     """
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     if is_local_rank_zero:
@@ -797,9 +996,10 @@ def restore_model(
     if not os.path.exists(checkpoint_dir):
         raise RuntimeError(f"checkpoint_dir[{checkpoint_dir}] not exists.")
 
-    meta_path = os.path.join(checkpoint_dir, "meta")
+    meta_path = os.path.join(checkpoint_dir, CKPT_META_FILENAME)
     model_ckpt_path = os.path.join(checkpoint_dir, "model")
     optim_ckpt_path = os.path.join(checkpoint_dir, "optimizer")
+    dense_ema_ckpt_path = os.path.join(checkpoint_dir, "dense_ema")
 
     cur_world_size = dist.get_world_size() if dist.is_initialized() else 1
     needs_mch_redistribution = _needs_mch_redistribution(
@@ -817,14 +1017,21 @@ def restore_model(
         if is_local_rank_zero:
             logger.info(f"Restoring model state from {model_ckpt_path}...")
         state_dict = model.state_dict()
+        planner = PartialLoadPlanner(
+            ckpt_param_map_path=ckpt_param_map_path,
+            skip_output_segments_tensor=needs_mch_redistribution,
+        )
         load(
             state_dict,
             checkpoint_id=model_ckpt_path,
-            planner=PartialLoadPlanner(
-                ckpt_param_map_path=ckpt_param_map_path,
-                skip_output_segments_tensor=needs_mch_redistribution,
-            ),
+            planner=planner,
         )
+        if error_on_missing_keys and planner.skipped_keys:
+            raise RuntimeError(
+                f"checkpoint[{model_ckpt_path}] is missing "
+                f"{len(planner.skipped_keys)} model states: "
+                + ", ".join(sorted(planner.skipped_keys))
+            )
         if needs_mch_redistribution:
             _redistribute_mch_state(model)
         model.load_state_dict(state_dict)
@@ -850,28 +1057,88 @@ def restore_model(
             if is_local_rank_zero:
                 logger.warning(f"optim_ckpt_path[{optim_ckpt_path}] not exists.")
 
+    if dense_ema is not None:
+        dense_ema.reset()
+        if os.path.exists(dense_ema_ckpt_path):
+            state_dict = dense_ema.state_dict()
+            planner = PartialLoadPlanner(
+                ckpt_param_map_path=ckpt_param_map_path,
+                warn_on_missing_keys=False,
+            )
+            load(
+                state_dict,
+                checkpoint_id=dense_ema_ckpt_path,
+                planner=planner,
+            )
+        else:
+            if is_local_rank_zero:
+                logger.warning(
+                    f"Dense EMA checkpoint [{dense_ema_ckpt_path}] not found; "
+                    "EMA will restart from the next optimizer step."
+                )
+
+    if use_dense_ema:
+        if os.path.exists(dense_ema_ckpt_path):
+            state_dict = dict(model.named_parameters())
+            planner = PartialLoadPlanner(
+                ckpt_param_map_path=ckpt_param_map_path,
+                warn_on_missing_keys=False,
+            )
+            load(
+                state_dict,
+                checkpoint_id=dense_ema_ckpt_path,
+                planner=planner,
+            )
+        elif is_local_rank_zero:
+            logger.warning(
+                f"Dense EMA checkpoint [{dense_ema_ckpt_path}] not found; "
+                "using original model parameters."
+            )
+
     if has_dynamicemb:
         from dynamicemb.dump_load import DynamicEmbLoad
 
         dynamicemb_path = os.path.join(checkpoint_dir, "dynamicemb")
         if os.path.exists(dynamicemb_path):
+            # Training never sets INPUT_TILE, but exporting with
+            # INPUT_TILE=3 adds twin user-side modules (`ebc_user`,
+            # `mc_ebc_user`, `ec_dict_user`, `mc_ec_dict_user`) that
+            # share dynamic-embedding tables with their non-user counterparts.
+            # Build a local symlink view instead of mutating the checkpoint
+            # directory, which may be read-only or remote-mounted.
+            dynamicemb_load_path = dynamicemb_path
+            dynamicemb_view = None
+            if is_input_tile_emb():
+                dynamicemb_view = tempfile.TemporaryDirectory(
+                    prefix=f"tzrec_dynamicemb_rank{os.environ.get('RANK', '0')}_"
+                )
+                dynamicemb_load_path = _make_dynamicemb_input_tile_user_view(
+                    dynamicemb_path, dynamicemb_view.name
+                )
             logger.info(
                 f"RANK[{os.environ.get('RANK', 0)}] restoring dynamic embedding..."
             )
-            DynamicEmbLoad(
-                dynamicemb_path,
-                model,
-                table_names=meta.get("dynamicemb_load_table_names", None),
-                optim=meta.get("dynamicemb_load_optim", optimizer is not None),
-                counter=True,
-            )
+            try:
+                DynamicEmbLoad(
+                    dynamicemb_load_path,
+                    model,
+                    table_names=meta.get("dynamicemb_load_table_names", None),
+                    optim=meta.get("dynamicemb_load_optim", optimizer is not None),
+                    counter=True,
+                )
+            finally:
+                if dynamicemb_view is not None:
+                    dynamicemb_view.cleanup()
             logger.info(
                 f"RANK[{os.environ.get('RANK', 0)}] restore dynamic embedding finished."
             )
 
 
 def save_model(
-    checkpoint_dir: str, model: nn.Module, optimizer: Optional[optim.Optimizer] = None
+    checkpoint_dir: str,
+    model: nn.Module,
+    optimizer: Optional[optim.Optimizer] = None,
+    dense_ema: Optional[DenseEMA] = None,
 ) -> None:
     """Save model state.
 
@@ -879,6 +1146,7 @@ def save_model(
         checkpoint_dir (str): easyrec model checkpoint dir.
         model (nn.Module): a EasyRec model.
         optimizer (optim.Optimizer, optional): a optimizer.
+        dense_ema: Dense EMA state to save.
     """
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         logger.info(f"Saving checkpoint to {checkpoint_dir}...")
@@ -887,6 +1155,11 @@ def save_model(
         save(
             optimizer.state_dict(),
             checkpoint_id=os.path.join(checkpoint_dir, "optimizer"),
+        )
+    if dense_ema is not None:
+        save(
+            dense_ema.state_dict(),
+            checkpoint_id=os.path.join(checkpoint_dir, "dense_ema"),
         )
     if has_dynamicemb:
         from dynamicemb.dump_load import DynamicEmbDump
@@ -914,9 +1187,64 @@ def save_model(
 
 
 DATALOADER_CKPT_FILENAME = "dataloader_state.json"
+CKPT_SUCCESS_FILENAME = "_SUCCESS"
+CKPT_META_FILENAME = "meta"
 # reserved dataloader_state key: last checkpoint's event-time watermark (seconds);
 # no ":" so per-source consumers skip it.
 DATA_TS_WATERMARK = "__data_ts_watermark__"
+# reserved dataloader_state key: number of completed data passes; resume
+# continues the epoch budget from here. no ":" so per-source consumers skip it.
+EPOCHS_COMPLETED = "__epochs_completed__"
+
+
+def save_meta(
+    checkpoint_dir: str,
+    step: int,
+    data_ts: Optional[float] = None,
+) -> None:
+    """Describe a checkpoint in its meta file.
+
+    Records the step, the consumed event-time when the data source has one, and
+    the CHECKPOINT_TAG label when set, alongside whatever restore-relevant keys
+    a converted checkpoint already carries.
+
+    Args:
+        checkpoint_dir: directory of the checkpoint.
+        step: step of the checkpoint.
+        data_ts: quorum event-time (seconds) of the consumed data, if any.
+    """
+    if int(os.environ.get("RANK", 0)) == 0:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        meta: Dict[str, Any] = {"step": step}
+        if data_ts is not None:
+            meta["data_ts"] = data_ts
+        tag = env_util.checkpoint_tag()
+        if tag:
+            meta["tag"] = tag
+        with open(os.path.join(checkpoint_dir, CKPT_META_FILENAME), "w") as f:
+            json.dump(meta, f)
+
+
+def save_success_marker(checkpoint_dir: str) -> None:
+    """Mark a checkpoint as completely written.
+
+    Schedulers that poll a model directory need to tell a finished checkpoint
+    from one still being written. The marker is empty and written last, after
+    every rank has finished its shards and after every other file in the
+    checkpoint, so its presence alone means the whole checkpoint is readable --
+    do not write anything into it, and do not move this call earlier.
+
+    Args:
+        checkpoint_dir: directory of the checkpoint to mark.
+    """
+    if dist.is_initialized():
+        dist.barrier()
+    if int(os.environ.get("RANK", 0)) == 0:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        marker_path = os.path.join(checkpoint_dir, CKPT_SUCCESS_FILENAME)
+        with open(marker_path, "w"):
+            pass
+        logger.info(f"Saved checkpoint success marker to {marker_path}")
 
 
 def save_dataloader_state(

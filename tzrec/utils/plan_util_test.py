@@ -29,6 +29,7 @@ from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.plan_util import DynamicProgrammingProposer, _sparse_dp_proposor_numpy
+from tzrec.utils.test_util import mark_ci_scope
 
 
 class PlanUtilTest(unittest.TestCase):
@@ -444,6 +445,7 @@ class DynamicProgrammingProposerTest(unittest.TestCase):
 
 @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for dynamicemb.")
+@mark_ci_scope("gpu")
 class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
     """End-to-end exercise of the dynamicemb planner integration."""
 
@@ -508,7 +510,7 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
         self.assertEqual(caching_modes, [False, True])
         load_factors = sorted(
             {
-                round(so.cache_load_factor, 4)
+                round(so.cache_load_factor or 0.0, 4)
                 for so in search_space
                 if getattr(so, "use_dynamicemb", False)
             }

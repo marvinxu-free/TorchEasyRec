@@ -6,7 +6,7 @@ repos:
         files: \.py$
         args: ["--license-filepath", "data/.license_header.txt", "--allow-past-years"]
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.11
+    rev: v0.16.4
     hooks:
       - id: ruff
         args: [ --fix ]
@@ -16,13 +16,15 @@ repos:
     hooks:
       - id: trailing-whitespace
       - id: check-yaml
+      - id: check-json
+      - id: check-toml
       - id: end-of-file-fixer
       - id: requirements-txt-fixer
       - id: check-merge-conflict
       - id: mixed-line-ending
         args: ["--fix=lf"]
   - repo: https://github.com/codespell-project/codespell
-    rev: v2.4.2
+    rev: v2.4.3
     hooks:
       - id: codespell
         args: ["--skip", "*.json", "-L", "TBE,dout,MoT"]

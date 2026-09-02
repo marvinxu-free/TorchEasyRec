@@ -71,7 +71,7 @@ if __name__ == "__main__":
         "--remove_bucketizer",
         action="store_true",
         default=False,
-        help="remove bucktizer params in fg json.",
+        help="remove bucketizer params in fg json.",
     )
     parser.add_argument(
         "--debug",
@@ -91,12 +91,15 @@ if __name__ == "__main__":
         dataloader = create_dataloader(
             pipeline_config.data_config, features, pipeline_config.train_input_path
         )
-        iterator = iter(dataloader)
+        iterator = dataloader.get_iterator()  # pyre-ignore[16]
         _ = next(iterator)
 
     tmp_dir = tempfile.mkdtemp(prefix="tzrec_")
     fg_json = create_fg_json(
-        features, asset_dir=tmp_dir, remove_bucketizer=args.remove_bucketizer
+        features,
+        asset_dir=tmp_dir,
+        remove_bucketizer=args.remove_bucketizer,
+        for_odps=True,
     )
 
     if args.reserves is not None:
@@ -144,6 +147,4 @@ if __name__ == "__main__":
                 logger.info(f"uploading resource [{fname}].")
                 resource = o.create_resource(fname, "file", file_obj=open(fpath, "rb"))
 
-    if tmp_dir is None:
-        if os.path.exists(tmp_dir):
-            shutil.rmtree(tmp_dir)
+    shutil.rmtree(tmp_dir)

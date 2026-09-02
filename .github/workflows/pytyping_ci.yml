@@ -9,7 +9,7 @@ jobs:
   ci-test:
     runs-on: tzrec-codestyle-runner
     container:
-      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.2
+      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.4
     steps:
       - name: FetchCommit ${{ github.event.pull_request.head.sha }}
         uses: actions/checkout@v4
@@ -22,4 +22,4 @@ jobs:
           cd run_${{ github.run_id }}
           pip install -r requirements-gpu.txt
           bash scripts/gen_proto.sh
-          python scripts/pyre_check.py
+          pyrefly check

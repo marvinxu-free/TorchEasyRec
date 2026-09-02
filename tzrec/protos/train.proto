@@ -29,6 +29,97 @@ message GradClipping {
     optional bool enable_global_grad_clip = 4 [default = false];
 }
 
+message FeatureStoreConfig {
+    // Cloud credentials (AK/SK/STS) are resolved at runtime through the
+    // Alibaba Cloud default credential provider chain (alibabacloud_credentials).
+    // FeatureDB credentials are read from FEATUREDB_USERNAME/FEATUREDB_PASSWORD.
+    // FeatureStore control-plane region. An explicitly empty value falls back
+    // to ALIBABA_CLOUD_REGION at runtime.
+    required string region = 1;
+    // Existing FeatureStore project name and target DynamicEmbedding FeatureView
+    // name. The view is validated at startup and created when it does not exist,
+    // together with a default FeatureStore entity that is auto-created on demand.
+    required string project_name = 2;
+    required string feature_view_name = 3;
+    // FeatureDB version for this incremental training run.
+    required string version = 5;
+
+
+    // Optional FeatureStore control-plane endpoint override, passed directly to
+    // the FeatureStore SDK, which owns endpoint handling and connection errors.
+    optional string endpoint = 6;
+    // Maximum records submitted before each SDK write_flush() completion gate.
+    optional uint32 upload_batch_size = 7 [default = 1000];
+    // Total attempts per rank for one step. All retries reuse the version;
+    // each attempt reserves a newer monotonic ts range and fully replays the
+    // rank's delta so incremental readers cannot miss a partial earlier attempt.
+    optional uint32 max_retries = 8 [default = 3];
+    optional uint32 retry_backoff_secs = 9 [default = 5];
+    // Maximum time normal training shutdown waits for the uploader to drain.
+    optional uint32 shutdown_timeout_secs = 10 [default = 600];
+    // Apply back-pressure when too many completed dumps await upload; bounds
+    // the per-rank memory retained by pending in-memory deltas.
+    optional uint32 max_pending_steps = 11 [default = 32];
+    optional uint32 poll_interval_secs = 12 [default = 1];
+    // Creation settings used only when feature_view_name does not yet exist.
+    optional uint32 feature_view_ttl_secs = 13 [default = 1296000];
+    optional uint32 feature_view_shard_count = 14 [default = 20];
+    optional uint32 feature_view_replication_count = 15 [default = 1];
+    reserved 4, 16;
+    reserved "feature_entity_name", "allow_custom_endpoint";
+    // Also write the local per-rank delta parquet files while uploading to
+    // FeatureStore (e.g. for the offline readback checker); by default the
+    // delta is handed to the uploader in memory and never touches disk.
+    optional bool retain_local_dump = 17 [default = false];
+    // Wire format for delta upload. "ARROW" (default) streams a columnar Arrow
+    // IPC batch through write_features_arrow(), avoiding the JSON path's per-row
+    // dict construction and embedding deep-copy; "JSON" keeps the legacy
+    // write_features() per-row payload. Both paths use MERGE write_mode.
+    optional string upload_format = 18 [default = "ARROW"];
+}
+
+enum DeltaEmbeddingQuantType {
+    DELTA_EMBEDDING_QUANT_NONE = 0;
+    DELTA_EMBEDDING_QUANT_INT8 = 1;
+}
+
+message DeltaEmbeddingDumpConfig {
+    // ZCH features publish raw feature ids: every id touched, admitted or
+    // evicted, each with the row the model now serves for it -- its trained row
+    // while the table holds it, the shared fallback row once it does not
+    // (FeatureStore has no delete, so a stale vector must be overwritten).
+    // Dump touched ids and their latest embedding every N training steps. Do not
+    // set this together with dump_interval_minutes.
+    // Larger intervals retain a longer id window in memory; auto compaction reduces
+    // per-batch tensor buildup but unique ids still scale with the interval.
+    optional uint32 dump_interval_steps = 1 [default = 1000];
+    // output directory. default is ${model_dir}/delta_embedding_dump
+    optional string output_dir = 2;
+    // parquet file prefix
+    optional string file_prefix = 3 [default = "delta_embedding"];
+    // Presence enables best-effort per-rank background upload to FeatureStore.
+    optional FeatureStoreConfig feature_store_config = 4;
+    // Dump after this many elapsed minutes. The timer starts when training starts.
+    // Do not set this together with dump_interval_steps.
+    optional uint32 dump_interval_minutes = 5;
+    // Quantization format for dumped embeddings. INT8 applies rowwise uint8
+    // quantization (QUint8RowwiseF16: uint8 values + fp16 scale/offset, 4 extra
+    // bytes per row) using the same format as distributed sparse export. Requires
+    // even embedding_dim.
+    optional DeltaEmbeddingQuantType quant_type = 6
+        [default = DELTA_EMBEDDING_QUANT_NONE];
+    // Publish all-zero tombstone rows for dynamicemb keys evicted since the
+    // last dump; the polling processor detects them and deletes the key from
+    // NvEmbeddings, reclaiming its memory (FeatureStore has no delete). While
+    // enabled, delta dump mode also arms dynamicemb's evicted-key recording
+    // (evicted_item_mode=RETAIN_KEY) automatically; the retained keys live in
+    // per-rank GPU memory and grow with eviction volume until each dump
+    // drains them, so keep the dump interval short on high-churn tables.
+    // Requires a dynamicemb build with EvictedItemMode; older builds degrade
+    // to a warning.
+    optional bool dump_evicted_tombstones = 7 [default = true];
+}
+
 message TrainConfig {
     // embedding part optimizer
     required SparseOptimizer sparse_optimizer = 1;
@@ -81,5 +172,9 @@ message TrainConfig {
     // fraction of workers (0,1] that must pass a boundary/target before a
     // timestamp checkpoint fires; default 0.5 (1.0 = all). outlier-robust.
     optional float save_checkpoints_timestamp_quorum = 23 [default = 0.5];
+    // Configuring this field dumps changed sparse embedding rows during CUDA
+    // training. Multi-GPU training writes one parquet shard per rank;
+    // column-wise embedding sharding is not supported.
+    optional DeltaEmbeddingDumpConfig delta_embedding_dump_config = 24;
     // TBD: qcomm config
 }

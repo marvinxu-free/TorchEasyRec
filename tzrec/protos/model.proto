@@ -1,6 +1,7 @@
 syntax = "proto2";
 package tzrec.protos;
 
+import "google/protobuf/any.proto";
 import "tzrec/protos/models/rank_model.proto";
 import "tzrec/protos/models/multi_task_rank.proto";
 import "tzrec/protos/models/match_model.proto";
@@ -41,6 +42,11 @@ enum Kernel {
     TRITON = 0;
     PYTORCH = 1;
     CUTLASS = 2;
+}
+
+message CustomModel {
+    required string class_path = 1;
+    optional google.protobuf.Any config = 2;
 }
 
 message ModelConfig {
@@ -95,7 +101,7 @@ message ModelConfig {
         SDCLMasknetSwish sdcl_masknet_swish = 507;
 
         // SID generation models
-        // (600 is reserved for SidRqvae, arriving in the follow-up PR)
+        SidRqvae sid_rqvae = 600;
         SidRqkmeans sid_rqkmeans = 601;
 
         DBMTL_DCNv2 dbmtl_dcnv2 = 208;
@@ -107,6 +113,8 @@ message ModelConfig {
         DBMTL_LHUC_CGC dbmtl_lhuc_cgc = 214;
         DBMTL_AFP_LHUC_CGC dbmtl_afp_lhuc_cgc = 215;
         MMOE_LHUC mmoe_lhuc = 216;
+
+        CustomModel custom_model = 1000;
     }
 
     optional uint32 num_class = 2 [default = 1];

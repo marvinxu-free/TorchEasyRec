@@ -11,12 +11,11 @@
 
 import os
 import shutil
-import tempfile
 import unittest
 from collections import OrderedDict
 
 import torch
-from hypothesis import Verbosity, assume, given, settings
+from hypothesis import Verbosity, assume, given
 from hypothesis import strategies as st
 from torchrec import JaggedTensor, KeyedJaggedTensor
 
@@ -36,7 +35,17 @@ from tzrec.protos import (
 )
 from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.utils.state_dict_util import init_parameters
-from tzrec.utils.test_util import TestGraphType, create_test_model, gpu_unavailable
+from tzrec.utils.test_util import (
+    TestGraphType,
+    cleanup_cuda_memory,
+    create_test_model,
+    gpu_unavailable,
+    make_test_dir,
+    mark_ci_scope,
+)
+from tzrec.utils.test_util import (
+    hypothesis_settings as settings,
+)
 
 
 def _build_model(
@@ -356,13 +365,24 @@ def _build_batch(
     ).to(device)
 
 
+@mark_ci_scope("gpu")
 class DlrmHSTUTest(unittest.TestCase):
+    def teardown_example(self, example):
+        try:
+            cleanup_cuda_memory()
+        finally:
+            self._cleanup_test_dir()
+
     def setUp(self):
         self.test_dir = None
 
     def tearDown(self):
+        self._cleanup_test_dir()
+
+    def _cleanup_test_dir(self):
         if self.test_dir is not None and os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
+        self.test_dir = None
 
     @unittest.skipIf(*gpu_unavailable)
     @given(
@@ -426,7 +446,7 @@ class DlrmHSTUTest(unittest.TestCase):
         elif graph_type == TestGraphType.AOT_INDUCTOR:
             data = batch.to_dict()
             data = OrderedDict(sorted(data.items()))
-            self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
+            self.test_dir = make_test_dir()
             dlrm_hstu.set_is_inference(True)
             dlrm_hstu = create_test_model(dlrm_hstu, graph_type, data, self.test_dir)
             predictions = dlrm_hstu(data)

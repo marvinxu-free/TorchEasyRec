@@ -10,7 +10,6 @@
 # limitations under the License.
 
 
-import gc
 import unittest
 
 import torch
@@ -18,17 +17,19 @@ from hypothesis import Verbosity, given
 from hypothesis import strategies as st
 
 from tzrec.ops import Kernel
-from tzrec.utils.test_util import get_test_dtypes, gpu_unavailable, mark_ci_scope
+from tzrec.utils.test_util import (
+    cleanup_cuda_memory,
+    get_test_dtypes,
+    gpu_unavailable,
+    mark_ci_scope,
+)
 from tzrec.utils.test_util import hypothesis_settings as settings
 
 
-@mark_ci_scope("h20")
+@mark_ci_scope("h20", "gpu")
 class LayerNormTest(unittest.TestCase):
     def teardown_example(self, example):
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.memory_summary()  # prevent oom
+        cleanup_cuda_memory()
 
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore[56]
@@ -115,8 +116,10 @@ class LayerNormTest(unittest.TestCase):
             layer_norm_func = layer_norm
             has_bias = True
         if has_bias:
+            # pyrefly: ignore[bad-keyword-argument]
             ref_out = layer_norm_func(x, weight, bias, eps=1e-6, kernel=ref_kernel)
         else:
+            # pyrefly: ignore[missing-argument]
             ref_out = layer_norm_func(x, weight, eps=1e-6, kernel=ref_kernel)
         dout = torch.randn_like(ref_out) * 0.05
         ref_out.backward(dout)
@@ -133,8 +136,10 @@ class LayerNormTest(unittest.TestCase):
         if has_bias:
             bias = bias.detach().clone().requires_grad_()
         if has_bias:
+            # pyrefly: ignore[bad-keyword-argument]
             opt_out = layer_norm_func(x, weight, bias, eps=1e-6, kernel=real_kernel)
         else:
+            # pyrefly: ignore[missing-argument]
             opt_out = layer_norm_func(x, weight, eps=1e-6, kernel=real_kernel)
         dout = dout.detach().clone()
         opt_out.backward(dout)
@@ -146,6 +151,7 @@ class LayerNormTest(unittest.TestCase):
         torch.testing.assert_close(ref_dx, opt_dx)
         torch.testing.assert_close(ref_dw, opt_dw)
         if has_bias:
+            # pyrefly: ignore[unbound-name]
             torch.testing.assert_close(ref_db, opt_db)
 
 

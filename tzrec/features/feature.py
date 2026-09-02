@@ -14,14 +14,14 @@ import os
 import shutil
 from collections import OrderedDict
 from copy import copy
-from functools import partial  # NOQA
-from typing import Any, Dict, List, Optional, Tuple, Union
+from functools import partial
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
 import pyfg
 import torch
-from torch import nn  # NOQA
+from torch import nn
 from torchrec.distributed.planner.types import ParameterConstraints
 from torchrec.modules.embedding_configs import (
     BaseEmbeddingConfig,
@@ -35,9 +35,9 @@ from torchrec.modules.mc_modules import (
     LRU_EvictionPolicy,
     ManagedCollisionModule,
     MCHManagedCollisionModule,
-    average_threshold_filter,  # NOQA
-    dynamic_threshold_filter,  # NOQA
-    probabilistic_threshold_filter,  # NOQA
+    average_threshold_filter,
+    dynamic_threshold_filter,
+    probabilistic_threshold_filter,
 )
 from torchrec.types import DataType
 
@@ -60,7 +60,7 @@ from tzrec.modules.dense_embedding_collection import (
 from tzrec.protos import feature_pb2
 from tzrec.protos.data_pb2 import FgMode
 from tzrec.protos.feature_pb2 import FeatureConfig, SequenceFeature
-from tzrec.utils import config_util, dynamicemb_util, env_util
+from tzrec.utils import config_util, dynamicemb_util, env_util, init_util
 from tzrec.utils.load_class import get_register_class_meta
 from tzrec.utils.logging_util import logger
 
@@ -418,16 +418,16 @@ class BaseFeature(object, metaclass=_meta_cls):
         self._side_inputs = None
         self._vocab_list = None
         self._vocab_dict = None
-        self._default_value = None
+        self._default_value: Optional[str] = None
         self._is_sequence = is_sequence
         self._is_grouped_seq = False
 
         # for sequence feature
         self._underline = "_" if env_util.use_rtp() else "__"
-        self.sequence_name = None
-        self.sequence_delim = None
-        self.sequence_length = None
-        self.sequence_pk = None
+        self.sequence_name: Optional[str] = None
+        self.sequence_delim: Optional[str] = None
+        self.sequence_length: Optional[int] = None
+        self.sequence_pk: Optional[str] = None
         if is_sequence:
             if sequence_name is None:
                 self.sequence_delim = self.config.sequence_delim
@@ -548,17 +548,19 @@ class BaseFeature(object, metaclass=_meta_cls):
     @property
     def default_value(self) -> str:
         """Effective default value for the feature."""
-        if self._default_value is None:
+        default_value = self._default_value
+        if default_value is None:
             val = self.config.default_value
             if self.is_sequence and not val:
                 logger.warning(
                     f"Sequence{self.__class__.__name__}[{self.name}] "
                     "not support empty default value now. reset to zero."
                 )
-                self._default_value = "0"
+                default_value = "0"
             else:
-                self._default_value = val
-        return self._default_value
+                default_value = val
+            self._default_value = default_value
+        return default_value
 
     @property
     def is_grouped_sequence(self) -> bool:
@@ -615,7 +617,7 @@ class BaseFeature(object, metaclass=_meta_cls):
             embedding_name = self.config.embedding_name or f"{self.name}_emb"
             init_fn = None
             if self.config.HasField("init_fn"):
-                init_fn = eval(f"partial({self.config.init_fn})")
+                init_fn = init_util.create_init_fn(self.config.init_fn)
             emb_bag_config = EmbeddingBagConfig(
                 num_embeddings=self.num_embeddings,
                 embedding_dim=self._embedding_dim,
@@ -642,7 +644,7 @@ class BaseFeature(object, metaclass=_meta_cls):
             embedding_name = self.config.embedding_name or f"{self.name}_emb"
             init_fn = None
             if self.config.HasField("init_fn"):
-                init_fn = eval(f"partial({self.config.init_fn})")
+                init_fn = init_util.create_init_fn(self.config.init_fn)
             emb_config = EmbeddingConfig(
                 num_embeddings=self.num_embeddings,
                 embedding_dim=self._embedding_dim,
@@ -699,7 +701,17 @@ class BaseFeature(object, metaclass=_meta_cls):
                 threshold_filtering_func = None
                 if self.config.zch.HasField("threshold_filtering_func"):
                     threshold_filtering_func = eval(
-                        self.config.zch.threshold_filtering_func
+                        self.config.zch.threshold_filtering_func,
+                        {
+                            "partial": partial,
+                            "nn": nn,
+                            "torch": torch,
+                            "average_threshold_filter": average_threshold_filter,
+                            "dynamic_threshold_filter": dynamic_threshold_filter,
+                            "probabilistic_threshold_filter": (
+                                probabilistic_threshold_filter
+                            ),
+                        },
                     )
                 if evict_type == "lfu":
                     eviction_policy = LFU_EvictionPolicy(
@@ -1128,7 +1140,7 @@ class BaseFeature(object, metaclass=_meta_cls):
             else:
                 return len(vocab_dict)
         else:
-            return ""
+            return 0
 
     @property
     def default_bucketize_value(self) -> int:
@@ -1141,6 +1153,14 @@ class BaseFeature(object, metaclass=_meta_cls):
     def assets(self) -> Dict[str, str]:
         """Asset file paths."""
         return {}
+
+    def odps_assets(self) -> Dict[str, str]:
+        """Asset file paths for odps fg."""
+        return self.assets()
+
+    def odps_fg_json(self) -> List[Dict[str, Any]]:
+        """Get fg json config for odps fg."""
+        return self.fg_json()
 
     def __del__(self) -> None:
         # pyre-ignore [16]
@@ -1271,14 +1291,16 @@ def _copy_assets(
     feature: BaseFeature,
     asset_dir: Optional[str] = None,
     use_relative_asset_dir: bool = False,
+    for_odps: bool = False,
 ) -> BaseFeature:
-    if asset_dir and len(feature.assets()) > 0:
+    assets = feature.odps_assets() if for_odps else feature.assets()
+    if asset_dir and len(assets) > 0:
         # deepcopy feature config
         feature_config = type(feature.feature_config)()
         feature_config.CopyFrom(feature.feature_config)
         feature = copy(feature)
         feature.feature_config = feature_config
-        for k, v in feature.assets().items():
+        for k, v in assets.items():
             with open(v, "rb") as f:
                 fhash = hashlib.md5(f.read()).hexdigest()
             fprefix, fext = os.path.splitext(os.path.basename(v))
@@ -1300,21 +1322,82 @@ def _remove_one_feature_bucketizer(fg_json: Dict[str, Any]) -> Dict[str, Any]:
     fg_json.pop("vocab_list", None)
     fg_json.pop("boundaries", None)
     fg_json.pop("num_buckets", None)
-    if fg_json["feature_type"] != "tokenize_feature":
+    if not fg_json["feature_type"].endswith("tokenize_feature"):
         fg_json.pop("vocab_file", None)
     return fg_json
+
+
+def _remove_bucketizer(
+    feature: BaseFeature,
+    fg_jsons: List[Dict[str, Any]],
+    referenced_names: Set[str],
+) -> List[Dict[str, Any]]:
+    """Remove bucketizer params in fg jsons of one feature.
+
+    Bucketizer params of fg dag intermediates are kept, and a feature used by
+    other features as `feature:xxx` can not have a bucketizer.
+    """
+    is_referenced = feature.name in referenced_names
+    results = []
+    for fg_json in fg_jsons:
+        # a stub feature and the intermediate fg jsons of a feature, e.g. the
+        # lookup of a multi-value LookupFeature, are not output as columns, and
+        # downstream features consume their bucketized value.
+        if feature.stub_type or fg_json.get("stub_type", False):
+            results.append(fg_json)
+            continue
+        no_bucketizer_fg_json = _remove_one_feature_bucketizer(dict(fg_json))
+        if is_referenced and no_bucketizer_fg_json != fg_json:
+            raise ValueError(
+                f"feature[{feature.name}] is used by other features as "
+                f"feature:{feature.name} and has a bucketizer, which is not "
+                "supported when remove bucketizer, because the value used by "
+                "downstream features is bucketized. Please set stub_type=true "
+                f"on [{feature.name}] if it is only a fg dag intermediate "
+                "result, or add another feature with the bucketizer for the "
+                "model to use."
+            )
+        results.append(no_bucketizer_fg_json)
+    return results
 
 
 def create_fg_json(
     features: List[BaseFeature],
     asset_dir: Optional[str] = None,
     remove_bucketizer: bool = False,
+    for_odps: bool = False,
 ) -> Dict[str, Any]:
-    """Create feature generate config for features."""
+    """Create feature generate config for features.
+
+    Args:
+        features (list): list of features.
+        asset_dir (str, optional): directory to copy asset files into.
+        remove_bucketizer (bool): remove bucketizer params in fg json or not.
+        for_odps (bool): create fg json for odps fg or not. official pyfg operator
+            libs are supplied by odps fg, we neither copy nor rename them.
+
+    Return:
+        fg json config.
+    """
+    referenced_names = set()
+    if remove_bucketizer:
+        for feature in features:
+            try:
+                referenced_names |= {
+                    name for side, name in feature.side_inputs if side == "feature"
+                }
+            except InvalidFgInputError:
+                pass
+
     results = []
     seq_to_idx = {}
     for feature in features:
-        feature = _copy_assets(feature, asset_dir, use_relative_asset_dir=True)
+        feature = _copy_assets(
+            feature, asset_dir, use_relative_asset_dir=True, for_odps=for_odps
+        )
+        fg_json = feature.odps_fg_json() if for_odps else feature.fg_json()
+        if remove_bucketizer:
+            fg_json = _remove_bucketizer(feature, fg_json, referenced_names)
         if feature.is_grouped_sequence:
             # pyre-ignore [16]
             if feature.sequence_name not in seq_to_idx:
@@ -1328,15 +1411,9 @@ def create_fg_json(
                     }
                 )
                 seq_to_idx[feature.sequence_name] = len(results) - 1
-            fg_json = feature.fg_json()
-            if remove_bucketizer:
-                fg_json = [_remove_one_feature_bucketizer(x) for x in fg_json]
             idx = seq_to_idx[feature.sequence_name]
             results[idx]["features"].extend(fg_json)
         else:
-            fg_json = feature.fg_json()
-            if remove_bucketizer:
-                fg_json = [_remove_one_feature_bucketizer(x) for x in fg_json]
             results.extend(fg_json)
     return {"features": results}
 

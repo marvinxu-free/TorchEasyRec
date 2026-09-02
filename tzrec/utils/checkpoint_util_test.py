@@ -10,6 +10,7 @@
 # limitations under the License.
 
 
+import json
 import multiprocessing as mp
 import os
 import shutil
@@ -22,6 +23,7 @@ import torch.distributed as dist
 import torchrec
 from parameterized import param, parameterized
 from torch import nn
+from torch.distributed.checkpoint import save
 from torchrec import EmbeddingBagCollection
 from torchrec.distributed.model_parallel import (
     DistributedModelParallel,
@@ -35,8 +37,10 @@ from torchrec.optim.optimizers import in_backward_optimizer_filter
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
+from tzrec.optim.ema import DenseEMA
 from tzrec.protos.export_pb2 import ExportConfig
 from tzrec.utils import checkpoint_util, misc_util
+from tzrec.utils.test_util import make_test_dir
 
 
 def _create_test_model(large_table_cnt=2, small_table_cnt=2):
@@ -120,6 +124,19 @@ def _create_test_model(large_table_cnt=2, small_table_cnt=2):
     return model, optimizer
 
 
+def _create_nested_embedding_model(module_path, value):
+    model = nn.Module()
+    parent = model
+    for module_name in module_path[:-1]:
+        child = nn.Module()
+        parent.add_module(module_name, child)
+        parent = child
+    embedding = nn.Embedding(num_embeddings=2, embedding_dim=4)
+    nn.init.constant_(embedding.weight, value)
+    parent.add_module(module_path[-1], embedding)
+    return model
+
+
 def _save_restore_worker(test_dir, rank, world_size, port):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
@@ -129,6 +146,39 @@ def _save_restore_worker(test_dir, rank, world_size, port):
     model, optimizer = _create_test_model()
     checkpoint_util.save_model(test_dir, model, optimizer)
     checkpoint_util.restore_model(test_dir, model, optimizer)
+
+
+def _report_ts_worker(
+    test_dir, rank, world_size, port, data_timestamp, ts_interval_s, ts_quorum
+):
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group(backend="gloo")
+
+    gathers = []
+    orig_all_gather_object = dist.all_gather_object
+
+    def _counting_all_gather_object(obj_list, obj, group=None):
+        gathers.append(1)
+        return orig_all_gather_object(obj_list, obj, group=group)
+
+    checkpoint_util.dist.all_gather_object = _counting_all_gather_object
+
+    mgr = checkpoint_util.CheckpointManager(test_dir)
+    mgr.set_save_policy(
+        save_steps=10,
+        save_epochs=0,
+        ts_interval_s=ts_interval_s,
+        ts_targets=[],
+        ts_quorum=ts_quorum,
+    )
+    # save is mocked, so the only gathers are the event-time reconciles
+    mgr.save = mock.MagicMock(return_value="ckpt")
+    mgr.maybe_save(10, model=None, data_timestamp=data_timestamp)
+    with open(os.path.join(test_dir, f"report_ts.{rank}"), "w") as f:
+        f.write(f"{mgr.save.call_args.args[5]!r} {len(gathers)}")
 
 
 def _partial_restore_worker(test_dir, rank, world_size, port):
@@ -173,9 +223,7 @@ def _remap_restore_worker(test_dir, rank, world_size, port, remap_file_path):
 
 class CheckpointUtilTest(unittest.TestCase):
     def setUp(self):
-        if not os.path.exists("./tmp"):
-            os.makedirs("./tmp")
-        self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
+        self.test_dir = make_test_dir()
 
     def tearDown(self):
         if os.path.exists(self.test_dir):
@@ -216,6 +264,40 @@ class CheckpointUtilTest(unittest.TestCase):
             os.path.join(self.test_dir, "custom")
         )
         self.assertEqual(ckpt_path, os.path.join(self.test_dir, "custom"))
+        self.assertEqual(step, 0)
+
+    def test_latest_checkpoint_with_unsuffixed_ckpt(self):
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt/model"))
+        ckpt_path, step = checkpoint_util.latest_checkpoint(self.test_dir)
+        self.assertEqual(ckpt_path, os.path.join(self.test_dir, "model.ckpt"))
+        self.assertEqual(step, 0)
+
+    def test_latest_checkpoint_prefers_stepped_over_unsuffixed(self):
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt/model"))
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt-10/model"))
+        ckpt_path, step = checkpoint_util.latest_checkpoint(self.test_dir)
+        self.assertEqual(ckpt_path, os.path.join(self.test_dir, "model.ckpt-10"))
+        self.assertEqual(step, 10)
+
+    def test_latest_checkpoint_without_any_ckpt(self):
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt"))
+        ckpt_path, step = checkpoint_util.latest_checkpoint(self.test_dir)
+        self.assertIsNone(ckpt_path)
+        self.assertEqual(step, -1)
+
+    def test_latest_checkpoint_prefers_dir_itself_over_unsuffixed(self):
+        os.makedirs(os.path.join(self.test_dir, "model"))
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt/model"))
+        ckpt_path, step = checkpoint_util.latest_checkpoint(self.test_dir)
+        self.assertEqual(ckpt_path, self.test_dir)
+        self.assertEqual(step, 0)
+
+    def test_latest_checkpoint_on_unsuffixed_ckpt_path(self):
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt/model"))
+        ckpt_path, step = checkpoint_util.latest_checkpoint(
+            os.path.join(self.test_dir, "model.ckpt")
+        )
+        self.assertEqual(ckpt_path, os.path.join(self.test_dir, "model.ckpt"))
         self.assertEqual(step, 0)
 
     def _remaining_ckpt_steps(self):
@@ -274,6 +356,25 @@ class CheckpointUtilTest(unittest.TestCase):
             manager.close()
         self.assertEqual(self._remaining_ckpt_steps(), [0, 10, 20, 30])
 
+    def test_checkpoint_manager_prune_keeps_protected_checkpoint(self):
+        for step in [0, 10, 20, 30]:
+            os.makedirs(os.path.join(self.test_dir, f"model.ckpt-{step}"))
+        protected_ckpt = os.path.join(self.test_dir, "model.ckpt-10")
+        manager = checkpoint_util.CheckpointManager(
+            self.test_dir, keep_checkpoint_max=2
+        )
+        manager.protect_checkpoint(protected_ckpt)
+        with mock.patch.dict(os.environ, {"RANK": "0"}):
+            manager.prune()
+            manager.close()
+        self.assertEqual(self._remaining_ckpt_steps(), [10, 20, 30])
+
+        manager.unprotect_checkpoint(protected_ckpt)
+        with mock.patch.dict(os.environ, {"RANK": "0"}):
+            manager.prune()
+            manager.close()
+        self.assertEqual(self._remaining_ckpt_steps(), [20, 30])
+
     def test_checkpoint_manager_prune_idempotent(self):
         for step in [0, 10, 20, 30]:
             os.makedirs(os.path.join(self.test_dir, f"model.ckpt-{step}"))
@@ -326,6 +427,65 @@ class CheckpointUtilTest(unittest.TestCase):
             checkpoint_util.best_checkpoint(self.test_dir, export_config),
         )
         self.assertEqual(manager.best_checkpoint()[1], 10)
+
+    def test_dist_report_ts_agrees_across_ranks(self):
+        """Ranks at different event-times record the same one on the checkpoint.
+
+        The directory a checkpoint is written to, and the event-time recorded in
+        its meta, have to be identical on every rank; the save is collective, so
+        a rank-local event-time would split one checkpoint across directories.
+        """
+        # triggers off: the reconcile happens once, only because a save fired
+        reported = self._run_report_ts_workers(
+            data_timestamps=[3600.0, 3660.0], ts_interval_s=0, ts_quorum=0.5
+        )
+        self.assertEqual(reported[0], reported[1])
+        # quorum 0.5 over [3600, 3660]: largest T with at least 1 value >= T
+        self.assertEqual(reported[0], f"{3660.0!r} 1")
+
+    def test_dist_report_ts_reuses_the_trigger_gather(self):
+        """With the triggers on, reporting must not gather a second time.
+
+        The trigger already reconciled this step; repeating it returns the same
+        value, so a second all_gather_object is pure waste. Quorum 1.0 with one
+        rank lacking a timestamp leaves the trigger unmet, which is the path
+        where the redundant gather used to happen.
+        """
+        reported = self._run_report_ts_workers(
+            data_timestamps=[3600.0, -1.0], ts_interval_s=3600, ts_quorum=1.0
+        )
+        self.assertEqual(reported[0], reported[1])
+        # quorum unmet -> nothing to report, and exactly one gather
+        self.assertEqual(reported[0], "None 1")
+
+    def _run_report_ts_workers(self, data_timestamps, ts_interval_s, ts_quorum):
+        port = misc_util.get_free_port()
+        procs = []
+        ctx = mp.get_context("spawn")
+        for i, data_timestamp in enumerate(data_timestamps):
+            p = ctx.Process(
+                target=_report_ts_worker,
+                args=(
+                    self.test_dir,
+                    i,
+                    len(data_timestamps),
+                    port,
+                    data_timestamp,
+                    ts_interval_s,
+                    ts_quorum,
+                ),
+            )
+            p.start()
+            procs.append(p)
+        for i, p in enumerate(procs):
+            p.join()
+            if p.exitcode != 0:
+                raise RuntimeError(f"worker-{i} failed.")
+        reported = []
+        for i in range(len(data_timestamps)):
+            with open(os.path.join(self.test_dir, f"report_ts.{i}")) as f:
+                reported.append(f.read())
+        return reported
 
     def test_dist_save_restore_model(self):
         port = misc_util.get_free_port()
@@ -403,14 +563,268 @@ class CheckpointUtilTest(unittest.TestCase):
             if p.exitcode != 0:
                 raise RuntimeError(f"worker-{i} failed.")
 
+    def test_input_tile_restores_without_mapping_file(self):
+        cases = [
+            (
+                "ebc",
+                ("group", "ebc", "embedding_bags", "table"),
+                ("group", "ebc_user", "embedding_bags", "table"),
+            ),
+            (
+                "legacy_ec_list",
+                ("group", "ec_list", "0"),
+                ("group", "ec_dict_user", "4"),
+            ),
+        ]
+        for name, source_path, target_path in cases:
+            with self.subTest(name=name):
+                checkpoint_dir = os.path.join(self.test_dir, name)
+                source = _create_nested_embedding_model(source_path, 1.0)
+                save(
+                    source.state_dict(),
+                    checkpoint_id=os.path.join(checkpoint_dir, "model"),
+                )
+                target = _create_nested_embedding_model(target_path, 0.0)
+
+                with mock.patch.dict(os.environ, {"INPUT_TILE": "3"}):
+                    checkpoint_util.restore_model(checkpoint_dir, target)
+
+                torch.testing.assert_close(
+                    target.state_dict()[".".join(target_path) + ".weight"],
+                    source.state_dict()[".".join(source_path) + ".weight"],
+                )
+
+    def test_restore_model_error_on_missing_keys(self):
+        class SmallModel(nn.Module):
+            def __init__(self, with_extra=False):
+                super().__init__()
+                self.dense = nn.Linear(4, 2)
+                if with_extra:
+                    self.extra = nn.Linear(2, 2)
+
+        port = misc_util.get_free_port()
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"tcp://127.0.0.1:{port}",
+            world_size=1,
+            rank=0,
+        )
+        try:
+            model = SmallModel()
+            checkpoint_util.save_model(self.test_dir, model)
+
+            restored = SmallModel(with_extra=True)
+            extra_weight = restored.extra.weight.detach().clone()
+            checkpoint_util.restore_model(self.test_dir, restored)
+            torch.testing.assert_close(restored.dense.weight, model.dense.weight)
+            self.assertTrue(torch.equal(restored.extra.weight, extra_weight))
+
+            with self.assertRaisesRegex(RuntimeError, "extra.weight"):
+                checkpoint_util.restore_model(
+                    self.test_dir, restored, error_on_missing_keys=True
+                )
+        finally:
+            dist.destroy_process_group()
+
+    def test_dense_ema_save_restore_and_inference_overlay(self):
+        class Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embedding = nn.Embedding(3, 2)
+                self.dense = nn.Linear(2, 1)
+                self.bn = nn.BatchNorm1d(1)
+
+        model = Model()
+        dense_ema = DenseEMA(
+            {
+                "dense.weight": model.dense.weight,
+                "dense.bias": model.dense.bias,
+            },
+            decay=0.5,
+        )
+        with torch.no_grad():
+            model.dense.weight.fill_(2.0)
+            model.dense.bias.fill_(2.0)
+            model.embedding.weight.fill_(5.0)
+            model.bn.running_mean.fill_(7.0)
+        dense_ema.update()
+        with torch.no_grad():
+            model.dense.weight.fill_(4.0)
+            model.dense.bias.fill_(4.0)
+        dense_ema.update()
+
+        with mock.patch.object(checkpoint_util, "has_dynamicemb", False):
+            checkpoint_util.save_model(
+                self.test_dir,
+                model,
+                dense_ema=dense_ema,
+            )
+
+            raw_model = Model()
+            checkpoint_util.restore_model(self.test_dir, raw_model)
+            torch.testing.assert_close(
+                raw_model.dense.weight,
+                torch.full_like(raw_model.dense.weight, 4.0),
+            )
+            torch.testing.assert_close(
+                raw_model.embedding.weight,
+                torch.full_like(raw_model.embedding.weight, 5.0),
+            )
+            torch.testing.assert_close(
+                raw_model.bn.running_mean,
+                torch.full_like(raw_model.bn.running_mean, 7.0),
+            )
+
+            inference_model = Model()
+            checkpoint_util.restore_model(
+                self.test_dir,
+                inference_model,
+                use_dense_ema=True,
+            )
+            torch.testing.assert_close(
+                inference_model.dense.weight,
+                torch.full_like(inference_model.dense.weight, 3.0),
+            )
+            torch.testing.assert_close(
+                inference_model.embedding.weight,
+                torch.full_like(inference_model.embedding.weight, 5.0),
+            )
+            torch.testing.assert_close(
+                inference_model.bn.running_mean,
+                torch.full_like(inference_model.bn.running_mean, 7.0),
+            )
+
+            resumed_model = Model()
+            resumed_ema = DenseEMA(
+                {
+                    "dense.weight": resumed_model.dense.weight,
+                    "dense.bias": resumed_model.dense.bias,
+                },
+                decay=0.5,
+            )
+            checkpoint_util.restore_model(
+                self.test_dir,
+                resumed_model,
+                dense_ema=resumed_ema,
+            )
+            torch.testing.assert_close(
+                resumed_model.dense.weight,
+                torch.full_like(resumed_model.dense.weight, 4.0),
+            )
+            torch.testing.assert_close(
+                resumed_ema.state_dict()["dense.weight"],
+                torch.full_like(resumed_model.dense.weight, 3.0),
+            )
+            self.assertEqual(resumed_ema.n_averaged.item(), 2)
+
+    def test_dense_ema_missing_checkpoint_resets_state(self):
+        model = nn.Linear(2, 1)
+        dense_ema = DenseEMA(
+            {
+                "weight": model.weight,
+                "bias": model.bias,
+            },
+            decay=0.5,
+        )
+        dense_ema.update()
+        self.assertEqual(dense_ema.n_averaged.item(), 1)
+        with torch.no_grad():
+            model.weight.fill_(3.0)
+            model.bias.fill_(4.0)
+
+        with mock.patch.object(checkpoint_util, "has_dynamicemb", False):
+            checkpoint_util.save_model(self.test_dir, model)
+            checkpoint_util.restore_model(
+                self.test_dir,
+                model,
+                dense_ema=dense_ema,
+            )
+        self.assertEqual(dense_ema.n_averaged.item(), 0)
+        torch.testing.assert_close(
+            dense_ema.state_dict()["weight"],
+            torch.full_like(model.weight, 3.0),
+        )
+        torch.testing.assert_close(
+            dense_ema.state_dict()["bias"],
+            torch.full_like(model.bias, 4.0),
+        )
+
+    def test_dense_ema_partial_checkpoint_keeps_restored_model_parameters(self):
+        model = nn.Linear(2, 1)
+        with torch.no_grad():
+            model.weight.fill_(2.0)
+            model.bias.fill_(3.0)
+        dense_ema = DenseEMA({"weight": model.weight}, decay=0.5)
+        dense_ema.update()
+        with torch.no_grad():
+            model.weight.fill_(4.0)
+            model.bias.fill_(5.0)
+
+        with mock.patch.object(checkpoint_util, "has_dynamicemb", False):
+            checkpoint_util.save_model(
+                self.test_dir,
+                model,
+                dense_ema=dense_ema,
+            )
+            resumed_model = nn.Linear(2, 1)
+            resumed_ema = DenseEMA(
+                {
+                    "weight": resumed_model.weight,
+                    "bias": resumed_model.bias,
+                },
+                decay=0.5,
+            )
+            checkpoint_util.restore_model(
+                self.test_dir,
+                resumed_model,
+                dense_ema=resumed_ema,
+            )
+
+        self.assertEqual(resumed_ema.n_averaged.item(), 1)
+        torch.testing.assert_close(
+            resumed_ema.state_dict()["weight"],
+            torch.full_like(resumed_model.weight, 2.0),
+        )
+        torch.testing.assert_close(
+            resumed_ema.state_dict()["bias"],
+            torch.full_like(resumed_model.bias, 5.0),
+        )
+
+    def test_remap_input_tile_user_key_maps_user_twins(self) -> None:
+        self.assertEqual(
+            checkpoint_util.remap_input_tile_user_key(
+                "model.eg.ebc_user.embedding_bags.t.weight"
+            ),
+            "model.eg.ebc.embedding_bags.t.weight",
+        )
+        self.assertEqual(
+            checkpoint_util.remap_input_tile_user_key("model.eg.mc_ec_dict_user.16.w"),
+            "model.eg.mc_ec_dict.16.w",
+        )
+
+    def test_remap_input_tile_user_key_passthrough(self) -> None:
+        self.assertEqual(
+            checkpoint_util.remap_input_tile_user_key("model.mlp.weight"),
+            "model.mlp.weight",
+        )
+
+    def test_remap_input_tile_user_key_respects_valid_keys(self) -> None:
+        fqn = "model.eg.ebc_user.embedding_bags.t.weight"
+        target = "model.eg.ebc.embedding_bags.t.weight"
+        # a matching pattern whose candidate is invalid leaves the key alone
+        self.assertEqual(
+            checkpoint_util.remap_input_tile_user_key(fqn, {"unrelated"}), fqn
+        )
+        self.assertEqual(
+            checkpoint_util.remap_input_tile_user_key(fqn, {target}), target
+        )
+
 
 class DataloaderCheckpointTest(unittest.TestCase):
     """Tests for dataloader checkpoint utilities."""
 
     def setUp(self):
-        if not os.path.exists("./tmp"):
-            os.makedirs("./tmp")
-        self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
+        self.test_dir = make_test_dir()
 
     def tearDown(self):
         if os.path.exists(self.test_dir):
@@ -436,6 +850,86 @@ class DataloaderCheckpointTest(unittest.TestCase):
         # Restore
         restored_state = checkpoint_util.restore_dataloader_state(self.test_dir)
         self.assertEqual(restored_state, checkpoint_state)
+
+    def _read_meta(self, ckpt_dir):
+        with open(os.path.join(ckpt_dir, checkpoint_util.CKPT_META_FILENAME)) as f:
+            return json.load(f)
+
+    def test_save_meta(self):
+        """A checkpoint records which step it is."""
+        with mock.patch.dict(os.environ, {}, clear=True):
+            checkpoint_util.save_meta(self.test_dir, 300)
+
+        self.assertEqual(self._read_meta(self.test_dir), {"step": 300})
+
+    def test_save_meta_data_ts(self):
+        """The consumed event-time is recorded when the source has one."""
+        with mock.patch.dict(os.environ, {}, clear=True):
+            checkpoint_util.save_meta(self.test_dir, 300, data_ts=1755000000.0)
+
+        self.assertEqual(
+            self._read_meta(self.test_dir), {"step": 300, "data_ts": 1755000000.0}
+        )
+
+    def test_save_meta_tag(self):
+        """CHECKPOINT_TAG labels the checkpoint for an external scheduler."""
+        with mock.patch.dict(os.environ, {"CHECKPOINT_TAG": "20260828"}):
+            checkpoint_util.save_meta(self.test_dir, 300)
+
+        self.assertEqual(
+            self._read_meta(self.test_dir), {"step": 300, "tag": "20260828"}
+        )
+
+    def test_save_meta_non_zero_rank_skips(self):
+        """Only rank 0 writes the meta."""
+        with mock.patch.dict(os.environ, {"RANK": "1"}):
+            checkpoint_util.save_meta(self.test_dir, 300)
+
+        self.assertFalse(
+            os.path.exists(
+                os.path.join(self.test_dir, checkpoint_util.CKPT_META_FILENAME)
+            )
+        )
+
+    def test_save_meta_keeps_restore_defaults(self):
+        """The recorded info leaves the restore-relevant keys at their defaults."""
+        with mock.patch.dict(os.environ, {"CHECKPOINT_TAG": "t"}):
+            checkpoint_util.save_meta(self.test_dir, 300, data_ts=1.0)
+
+        meta = self._read_meta(self.test_dir)
+        self.assertTrue(meta.get("load_model", True))
+        self.assertTrue(meta.get("load_optim", True))
+        self.assertIsNone(meta.get("dynamicemb_load_table_names", None))
+
+    def test_save_success_marker(self):
+        """The marker is empty; its presence is the whole signal."""
+        checkpoint_util.save_success_marker(self.test_dir)
+
+        marker_path = os.path.join(self.test_dir, checkpoint_util.CKPT_SUCCESS_FILENAME)
+        self.assertTrue(os.path.exists(marker_path))
+        self.assertEqual(os.path.getsize(marker_path), 0)
+
+    def test_save_success_marker_creates_dir(self):
+        """The marker can be written before the directory exists."""
+        ckpt_dir = os.path.join(self.test_dir, "model.ckpt-10")
+        checkpoint_util.save_success_marker(ckpt_dir)
+
+        self.assertTrue(
+            os.path.exists(
+                os.path.join(ckpt_dir, checkpoint_util.CKPT_SUCCESS_FILENAME)
+            )
+        )
+
+    def test_save_success_marker_non_zero_rank_skips(self):
+        """Only rank 0 writes the marker."""
+        with mock.patch.dict(os.environ, {"RANK": "1"}):
+            checkpoint_util.save_success_marker(self.test_dir)
+
+        self.assertFalse(
+            os.path.exists(
+                os.path.join(self.test_dir, checkpoint_util.CKPT_SUCCESS_FILENAME)
+            )
+        )
 
     def test_restore_dataloader_state_not_found(self):
         """Test restore returns None when no checkpoint exists."""
@@ -697,7 +1191,48 @@ class DataloaderCheckpointTest(unittest.TestCase):
         self.assertTrue(
             mgr.maybe_save(2, model=None, dataloader_state=state, data_timestamp=3600.0)
         )
-        self.assertEqual(state[checkpoint_util.DATA_TS_WATERMARK], 3600.0)
+        # the watermark is stamped into the saved state, not the caller's dict
+        self.assertNotIn(checkpoint_util.DATA_TS_WATERMARK, state)
+        saved_state = mgr.save.call_args.args[3]
+        self.assertEqual(saved_state[checkpoint_util.DATA_TS_WATERMARK], 3600.0)
+
+    def test_maybe_save_reports_event_time_on_step_trigger(self):
+        """A step-triggered save reports its event-time, with triggers off."""
+        mgr = self._policy_manager(save_steps=10)
+        state = {"topic:0": 5}
+        self.assertTrue(
+            mgr.maybe_save(
+                10, model=None, dataloader_state=state, data_timestamp=3600.0
+            )
+        )
+        # the trigger is off, so no resume watermark is stamped
+        saved_state = mgr.save.call_args.args[3]
+        self.assertNotIn(checkpoint_util.DATA_TS_WATERMARK, saved_state)
+        # but the checkpoint still reports which data it covers
+        self.assertEqual(mgr.save.call_args.args[5], 3600.0)
+
+    def test_maybe_save_no_event_time_reports_none(self):
+        """A source without event-times reports nothing to the marker."""
+        mgr = self._policy_manager(save_steps=10)
+        state = {"file:0": 5}
+        self.assertTrue(
+            mgr.maybe_save(10, model=None, dataloader_state=state, data_timestamp=-1.0)
+        )
+        saved_state = mgr.save.call_args.args[3]
+        self.assertNotIn(checkpoint_util.DATA_TS_WATERMARK, saved_state)
+        self.assertIsNone(mgr.save.call_args.args[5])
+
+    def test_set_save_policy_rejects_bad_quorum_without_triggers(self):
+        """The quorum is used by every save now, so it is always validated."""
+        mgr = checkpoint_util.CheckpointManager(self.test_dir)
+        with self.assertRaisesRegex(ValueError, "must be in"):
+            mgr.set_save_policy(
+                save_steps=10,
+                save_epochs=0,
+                ts_interval_s=0,
+                ts_targets=[],
+                ts_quorum=0,
+            )
 
     def test_reconcile_event_time_single_process(self):
         # not distributed: this rank's value passes through (quorum of one); -1.0
